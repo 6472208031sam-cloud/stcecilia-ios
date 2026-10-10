@@ -1,0 +1,19 @@
+# xcodegen project spec — generates StCecilia.xcodeproj on the CI runner.
+# (`brew install xcodegen && xcodegen generate`)
+name: StCecilia
+options:
+  bundleIdPrefix: io.github
+  deploymentTarget:
+    iOS: "15.0"
+targets:
+  StCecilia:
+    type: application
+    platform: iOS
+    sources:
+      - path: StCecilia/Sources
+    info:
+      path: StCecilia/Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.stcecilia
+        SWIFT_VERSION: "5.0"
