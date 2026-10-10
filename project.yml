@@ -11,9 +11,18 @@ targets:
     platform: iOS
     sources:
       - path: StCecilia/Sources
+    info:
+      properties:
+        CFBundleDisplayName: St Cecilia
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        ITSAppUsesNonExemptEncryption: false
+        NSLocationWhenInUseUsageDescription: "St Cecilia uses your location while you drive so it can alert you as you reach each bus stop."
+        NSLocationAlwaysAndWhenInUseUsageDescription: "St Cecilia tracks your ride in the background so stop alerts keep working when the screen is off or the app is minimized."
+        UIBackgroundModes: [location]
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.github.stcecilia
         SWIFT_VERSION: "5.0"
-        INFOPLIST_FILE: StCecilia/Info.plist
-        GENERATE_INFOPLIST_FILE: "NO"
