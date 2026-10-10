@@ -11,11 +11,9 @@ targets:
     platform: iOS
     sources:
       - path: StCecilia/Sources
-    info:
-      path: StCecilia/Info.plist
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.github.stcecilia
         SWIFT_VERSION: "5.0"
         INFOPLIST_FILE: StCecilia/Info.plist
-        GENERATE_INFOPLIST_FILE: NO
+        GENERATE_INFOPLIST_FILE: "NO"
