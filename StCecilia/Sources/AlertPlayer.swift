@@ -25,7 +25,7 @@ final class AlertPlayer {
                     self.sessionConfigured = true
                 }
                 try AVAudioSession.sharedInstance().setActive(true)
-                let buffer = self.makeBeepBuffer()
+                guard let buffer = self.makeBeepBuffer() else { return }
                 if !self.engine.isRunning {
                     try self.engine.start()
                 }
@@ -37,18 +37,18 @@ final class AlertPlayer {
         }
     }
 
-    private func makeBeepBuffer() -> AVAudioPCMBuffer {
+    private func makeBeepBuffer() -> AVAudioPCMBuffer? {
         let sampleRate = 44100.0
         let freqs = [660.0, 660.0, 880.0]
         let offsets = [0.0, 0.22, 0.44]
         let beepLen = 0.18
         let total = 0.44 + beepLen + 0.05
         let frames = Int(total * sampleRate)
-        let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1)!
-        let buffer = AVAudioPCMBuffer(pcmFormat: format,
-                                      frameCapacity: AVAudioFrameCount(frames))!
+        guard let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1),
+              let buffer = AVAudioPCMBuffer(pcmFormat: format,
+                                            frameCapacity: AVAudioFrameCount(frames)),
+              let data = buffer.floatChannelData else { return nil }
         buffer.frameLength = AVAudioFrameCount(frames)
-        let data = buffer.floatChannelData![0]
         for b in 0..<3 {
             let start = Int(offsets[b] * sampleRate)
             let len = Int(beepLen * sampleRate)

@@ -20,7 +20,7 @@ targets:
         ITSAppUsesNonExemptEncryption: false
         NSLocationWhenInUseUsageDescription: "St Cecilia uses your location while you drive so it can alert you as you reach each bus stop."
         NSLocationAlwaysAndWhenInUseUsageDescription: "St Cecilia tracks your ride in the background so stop alerts keep working when the screen is off or the app is minimized."
-        UIBackgroundModes: [location]
+        UIBackgroundModes: [location, audio]
         UILaunchScreen: {}
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
     settings:
