@@ -46,9 +46,9 @@ final class AlertPlayer {
         let frames = Int(total * sampleRate)
         guard let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1),
               let buffer = AVAudioPCMBuffer(pcmFormat: format,
-                                            frameCapacity: AVAudioFrameCount(frames)),
-              let data = buffer.floatChannelData else { return nil }
+                                            frameCapacity: AVAudioFrameCount(frames)) else { return nil }
         buffer.frameLength = AVAudioFrameCount(frames)
+        let data = buffer.floatChannelData![0]
         for b in 0..<3 {
             let start = Int(offsets[b] * sampleRate)
             let len = Int(beepLen * sampleRate)
