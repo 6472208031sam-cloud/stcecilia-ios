@@ -11,6 +11,8 @@ targets:
     platform: iOS
     sources:
       - path: StCecilia/Sources
+      - path: StCecilia/Resources
+        type: resources
     info:
       path: StCecilia/Info.plist
       properties:
