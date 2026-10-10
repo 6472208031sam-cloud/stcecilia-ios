@@ -36,7 +36,12 @@ final class LocationTracker: NSObject {
         manager.desiredAccuracy = kCLLocationAccuracyBest
         manager.distanceFilter = 5
         manager.activityType = .automotiveNavigation
-        manager.allowsBackgroundLocationUpdates = true
+        // Setting this without the 'location' UIBackgroundModes key throws
+        // NSException and kills the app at launch — guard it.
+        let bgModes = Bundle.main.object(forInfoDictionaryKey: "UIBackgroundModes") as? [String] ?? []
+        if bgModes.contains("location") {
+            manager.allowsBackgroundLocationUpdates = true
+        }
         manager.pausesLocationUpdatesAutomatically = false
         if #available(iOS 11.0, *) {
             manager.showsBackgroundLocationIndicator = true

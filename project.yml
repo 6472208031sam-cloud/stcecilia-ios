@@ -17,3 +17,4 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.github.stcecilia
         SWIFT_VERSION: "5.0"
+        INFOPLIST_FILE: StCecilia/Info.plist
