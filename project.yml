@@ -14,7 +14,7 @@ targets:
     info:
       path: StCecilia/Info.plist
       properties:
-        CFBundleDisplayName: St Cecilia
+        CFBundleDisplayName: St Cecilia v1
         CFBundleShortVersionString: "1.0"
         CFBundleVersion: "1"
         ITSAppUsesNonExemptEncryption: false
