@@ -12,6 +12,7 @@ targets:
     sources:
       - path: StCecilia/Sources
     info:
+      path: StCecilia/Info.plist
       properties:
         CFBundleDisplayName: St Cecilia
         CFBundleShortVersionString: "1.0"
