@@ -2,6 +2,7 @@ import Foundation
 import CoreLocation
 import UserNotifications
 import AudioToolbox
+import UIKit
 
 /// Owns background GPS tracking, arrival detection, alert sound/vibration,
 /// follower ntfy pushes and local notifications.
@@ -250,7 +251,16 @@ final class LocationTracker: NSObject {
             : "🚌 \(stop.label) reached."
         postArrivalNotification(message: msg)
         if r.followerOn && !r.topic.isEmpty {
-            NtfyClient.post(topic: r.topic, message: msg)
+            // The final stop tears down location updates right after this
+            // (finishRide), which would let iOS suspend us before the POST
+            // completes. A background task keeps us alive until it lands.
+            var taskID: UIBackgroundTaskIdentifier = .invalid
+            taskID = UIApplication.shared.beginBackgroundTask(withName: "ntfy-post") {
+                UIApplication.shared.endBackgroundTask(taskID)
+            }
+            NtfyClient.post(topic: r.topic, message: msg) {
+                UIApplication.shared.endBackgroundTask(taskID)
+            }
         }
         persist()
         pushSync(toast: "\(stop.label) reached")
