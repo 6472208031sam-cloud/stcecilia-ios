@@ -245,7 +245,7 @@ final class LocationTracker: NSObject {
         // Exact message formats from Android's TrackingService.onArrival.
         // (page is always "stcecilia" from the web page, so the tag is " (AM)"
         // exactly as on Android.)
-        let routeTag = (r.page == "pm") ? " (PM)" : " (AM)"
+        let routeTag = (r.tab == "pm") ? " (PM)" : " (AM)"
         let msg = isFinal
             ? "🚌 Final stop reached\(routeTag): \(stop.name)."
             : "🚌 \(stop.label) reached."
