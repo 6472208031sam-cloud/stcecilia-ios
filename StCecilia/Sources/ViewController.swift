@@ -44,17 +44,17 @@ class ViewController: UIViewController, WKNavigationDelegate, WKUIDelegate {
     // MARK: - Page lifecycle (mirrors MainActivity)
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        // Push the latest config (arms the schedule). If a schedule
-        // notification was tapped, start that ride. Otherwise do NOT start
-        // tracking — Android doesn't auto-start on launch either, and doing
-        // so inverts the user's GPS button (a tap meant to start actually
-        // stops the secret ride). The page resyncs itself on load via
-        // getStatus() if a native ride is already active.
+        // Push the latest config (arms the schedule). Auto-start tracking
+        // on launch (matches Android) — no manual tap needed.
         eval("if (typeof updateConfig === 'function') { try { updateConfig(); } catch(e){} }")
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
             guard let self = self, !self.autoStartDone else { return }
             self.autoStartDone = true
-            self.startScheduledRideIfPending()
+            // If a schedule notification was tapped, start that ride; otherwise
+            // auto-start the page's tracking (startTracking is idempotent).
+            if !self.startScheduledRideIfPending() {
+                self.eval("(function(){ try { if (typeof startTracking==='function') startTracking(); } catch(e){} })()")
+            }
         }
     }
 
