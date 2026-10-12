@@ -114,11 +114,27 @@ final class LocationTracker: NSObject {
     }
 
     /// Status JSON for the WebView to resync; "" when no ride is active.
-    /// Shape mirrors Android's getStatusJson().
+    /// A recently completed ride (within 15 min) is returned with
+    /// active=false so the page can show the arrived UI after a background
+    /// finish. Shape mirrors Android's getStatusJson().
     func statusJson() -> String {
-        guard let r = ride, !r.stops.isEmpty else { return "" }
+        if let r = ride, !r.stops.isEmpty {
+            return statusPayload(ride: r, active: true)
+        }
+        if let r = RideStore.load(), !r.stops.isEmpty, r.completed {
+            if let at = r.completedAt, Date().timeIntervalSince(at) < 15 * 60 {
+                return statusPayload(ride: r, active: false)
+            }
+            // Expired: drop it so a fresh page shows no ride.
+            RideStore.clear()
+        }
+        return ""
+    }
+
+    private func statusPayload(ride r: RideState, active: Bool) -> String {
         let payload: [String: Any] = [
-            "active": true,
+            "active": active,
+            "completed": r.completed,
             "page": r.page,
             "tab": r.tab,
             "reached": r.stops.map { $0.reached },
@@ -132,8 +148,9 @@ final class LocationTracker: NSObject {
     }
 
     /// Resume a persisted ride on launch (mirrors Android's START_STICKY restart).
+    /// A completed ride is for display only — never resume it as an active ride.
     func restore() {
-        guard let r = RideStore.load(), !r.stops.isEmpty else { return }
+        guard let r = RideStore.load(), !r.stops.isEmpty, !r.completed else { return }
         ride = r
         beginTracking()
     }
@@ -178,11 +195,17 @@ final class LocationTracker: NSObject {
     }
 
     private func finishRide() {
+        // Keep the state marked completed (with a timestamp) instead of
+        // deleting it, so the WebView can show the arrived UI on resume.
+        if let r = ride {
+            r.completed = true
+            r.completedAt = Date()
+            RideStore.save(r)
+        }
         ride = nil
         nearCount = 0
         nearTargetIdx = -1
         manager.stopUpdatingLocation()
-        RideStore.clear()
         jsEval?("if (typeof nativeFinished === 'function') { try { nativeFinished(); } catch(e){} }")
     }
 

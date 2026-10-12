@@ -63,6 +63,10 @@ final class RideState {
     var stops: [RideStop] = []
     var lastFixTime: Date?
     var lastFixAccuracy: Double = -1
+    /// Set when finishRide() completes the route. The persisted state is
+    /// kept (not deleted) so the WebView can show the arrived UI on resume.
+    var completed = false
+    var completedAt: Date?
 
     init() {}
 
@@ -84,6 +88,12 @@ final class RideState {
         schedOff2 = json["schedOff2"] as? Int ?? 1110
         schedWeekdaysOnly = json["schedWeekdaysOnly"] as? Bool ?? true
         scheduledRide = json["scheduledRide"] as? Bool ?? false
+        completed = json["completed"] as? Bool ?? false
+        if let ms = json["completedAt"] as? Double {
+            completedAt = Date(timeIntervalSince1970: ms / 1000)
+        } else if let ms = json["completedAt"] as? Int {
+            completedAt = Date(timeIntervalSince1970: Double(ms) / 1000)
+        }
         if let arr = json["stops"] as? [[String: Any]] {
             stops = arr.enumerated().map { RideStop(json: $0.element, index: $0.offset) }
         }
@@ -104,6 +114,8 @@ final class RideState {
             "schedOff2": schedOff2,
             "schedWeekdaysOnly": schedWeekdaysOnly,
             "scheduledRide": scheduledRide,
+            "completed": completed,
+            "completedAt": completedAt.map { $0.timeIntervalSince1970 * 1000 } ?? NSNull(),
             "stops": stops.map { $0.toJSON() }
         ]
     }
