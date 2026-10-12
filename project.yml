@@ -28,4 +28,4 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.github.stcecilia
-        SWIFT_VERSION: "7.0"
+        SWIFT_VERSION: "5.0"
