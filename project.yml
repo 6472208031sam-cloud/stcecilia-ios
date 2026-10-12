@@ -16,8 +16,8 @@ targets:
     info:
       path: StCecilia/Info.plist
       properties:
-        CFBundleDisplayName: St Cecilia v5
-        CFBundleShortVersionString: "5.0"
+        CFBundleDisplayName: St Cecilia v6
+        CFBundleShortVersionString: "6.0"
         CFBundleVersion: "5"
         ITSAppUsesNonExemptEncryption: false
         NSLocationWhenInUseUsageDescription: "St Cecilia uses your location while you drive so it can alert you as you reach each bus stop."
@@ -28,4 +28,4 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.github.stcecilia
-        SWIFT_VERSION: "5.0"
+        SWIFT_VERSION: "6.0"

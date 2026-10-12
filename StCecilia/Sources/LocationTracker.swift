@@ -217,6 +217,9 @@ final class LocationTracker: NSObject {
         if distance <= stop.radius && accuracy <= limit {
             // Tier 1: confident fix — arrive immediately.
             arrive(at: idx)
+        } else if distance <= 15 && accuracy <= 150 {
+            // Very close to the pin — trust it even with moderate accuracy.
+            arrive(at: idx)
         } else if accuracy <= 200 && distance <= stop.radius + accuracy {
             // Tier 2: poor accuracy (phone pocketed) — 3 consecutive fixes
             // near the stop confirm the arrival. A GPS jump won't persist.
