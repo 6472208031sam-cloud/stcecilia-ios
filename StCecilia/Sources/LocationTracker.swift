@@ -89,6 +89,14 @@ final class LocationTracker: NSObject {
         jsEval?("if (typeof nativeNoRide === 'function') { try { nativeNoRide(); } catch(e){} }")
     }
 
+    func markReached() {
+        guard let r = ride else { return }
+        let idx = r.stops.firstIndex(where: { !$0.reached }) ?? -1
+        if idx >= 0 && idx < r.stops.count {
+            arrive(at: idx)
+        }
+    }
+
     func updateConfig(configJson: String?) {
         guard let configJson = configJson,
               let data = configJson.data(using: .utf8),
