@@ -8,7 +8,7 @@ class ViewController: UIViewController, WKNavigationDelegate, WKUIDelegate {
     static weak var shared: ViewController?
 
     private static let pageURL = URL(
-        string: "https://6472208031sam-cloud.github.io/bus-stop-alerts/st-cecilia.html")!
+        string: "https://6472208031sam-cloud.github.io/bus-stop-alerts/st-cecilia.html?v=1.7")!
 
     private var webView: WKWebView!
     private var autoStartDone = false
