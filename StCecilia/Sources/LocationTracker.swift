@@ -292,7 +292,8 @@ final class LocationTracker: NSObject {
             taskID = UIApplication.shared.beginBackgroundTask(withName: "ntfy-post") {
                 UIApplication.shared.endBackgroundTask(taskID)
             }
-            NtfyClient.post(topic: r.topic, message: msg) {
+            let fullMsg = r.deviceId.isEmpty ? msg : msg + " [" + r.deviceId + "]"
+            NtfyClient.post(topic: r.topic, message: fullMsg) {
                 UIApplication.shared.endBackgroundTask(taskID)
             }
         }

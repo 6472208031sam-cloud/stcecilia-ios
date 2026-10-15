@@ -50,6 +50,7 @@ final class RideState {
     var page = "am"
     var tab = "am"
     var topic = ""
+    var deviceId = ""
     var followerOn = true
     var sound = true
     var snapDistance = 100.0
@@ -74,6 +75,7 @@ final class RideState {
         page = json["page"] as? String ?? "am"
         tab = json["tab"] as? String ?? "am"
         topic = json["topic"] as? String ?? ""
+        deviceId = json["deviceId"] as? String ?? ""
         followerOn = json["followerOn"] as? Bool ?? true
         sound = json["sound"] as? Bool ?? true
         if let d = json["snapDistance"] as? Double {
