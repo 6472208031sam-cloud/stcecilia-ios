@@ -48,7 +48,12 @@ final class NativeBridge {
         },
         hasBackgroundPermission: function() {
           return call('hasBackgroundPermission') === true;
-        }
+        },
+        getNativeLogs: function() {
+          var r = call('getNativeLogs');
+          return (typeof r === 'string') ? r : '';
+        },
+        clearNativeLogs: function() { call('clearNativeLogs'); }
       };
     })();
     """
@@ -79,6 +84,11 @@ final class NativeBridge {
             return jsonResponse(LocationTracker.shared.statusJson())
         case "hasBackgroundPermission":
             return jsonResponse(LocationTracker.shared.hasBackgroundPermission)
+        case "getNativeLogs":
+            return jsonResponse(LocationTracker.shared.nativeLogsText())
+        case "clearNativeLogs":
+            LocationTracker.shared.clearNativeLogs()
+            return jsonResponse(nil)
         default:
             return jsonResponse(nil)
         }

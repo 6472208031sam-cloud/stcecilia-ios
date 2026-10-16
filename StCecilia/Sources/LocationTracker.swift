@@ -18,6 +18,30 @@ final class LocationTracker: NSObject {
     private var nearTargetIdx = -1
     private var pendingConfig: String?
 
+    // MARK: - Diagnostic logging (viewable from the web page's Logs panel)
+    private var nativeLogs: [String] = []
+    private var lastGpsLogAt: Date = .distantPast
+    private static let logTimeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss.SSS"
+        return f
+    }()
+
+    private func nativeLog(_ cat: String, _ msg: String) {
+        let ts = Self.logTimeFormatter.string(from: Date())
+        nativeLogs.append("[\(ts)] [\(cat)] \(msg)")
+        if nativeLogs.count > 200 { nativeLogs.removeFirst(nativeLogs.count - 200) }
+    }
+
+    /// Joined log text for the WebView via NativeBridge.getNativeLogs().
+    func nativeLogsText() -> String {
+        return nativeLogs.joined(separator: "\n")
+    }
+
+    func clearNativeLogs() {
+        nativeLogs.removeAll()
+    }
+
     /// Set by ViewController: evaluates JS in the page.
     var jsEval: ((String) -> Void)?
     /// Called when a permission-deferred ride auto-starts.
@@ -53,13 +77,16 @@ final class LocationTracker: NSObject {
 
     /// Returns "started" / "permission_needed" / "error", exactly like Android.
     func startRide(configJson: String?, scheduled: Bool = false) -> String {
+        nativeLog("SYS", "startRide scheduled=\(scheduled)")
         guard let configJson = configJson, !configJson.isEmpty,
               let data = configJson.data(using: .utf8),
               (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) != nil else {
+            nativeLog("SYS", "startRide: invalid config -> error")
             return "error"
         }
         switch CLLocationManager.authorizationStatus() {
         case .notDetermined:
+            nativeLog("SYS", "startRide: permission_needed (requesting always)")
             pendingConfig = configJson
             manager.requestAlwaysAuthorization()
             return "permission_needed"
@@ -68,6 +95,7 @@ final class LocationTracker: NSObject {
         default:
             // denied / restricted / when-in-use: the page shows the
             // "Allow all the time" toast, same as Android.
+            nativeLog("SYS", "startRide: permission_needed (denied/restricted)")
             return "permission_needed"
         }
         // Already tracking: refresh config but keep the service's progress
@@ -76,10 +104,12 @@ final class LocationTracker: NSObject {
         applyConfig(jsonString: configJson, keepProgress: ride != nil)
         ride?.scheduledRide = scheduled
         beginTracking()
+        nativeLog("SYS", "startRide: started stops=\(ride?.stops.count ?? 0)")
         return "started"
     }
 
     func stopRide() {
+        nativeLog("SYS", "stopRide")
         guard ride != nil else { return }
         ride = nil
         nearCount = 0
@@ -93,11 +123,13 @@ final class LocationTracker: NSObject {
         guard let r = ride else { return }
         let idx = r.stops.firstIndex(where: { !$0.reached }) ?? -1
         if idx >= 0 && idx < r.stops.count {
+            nativeLog("STOP", "markReached manual: \(r.stops[idx].label)")
             arrive(at: idx)
         }
     }
 
     func updateConfig(configJson: String?) {
+        nativeLog("SYS", "updateConfig")
         guard let configJson = configJson,
               let data = configJson.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -195,6 +227,7 @@ final class LocationTracker: NSObject {
     }
 
     private func finishRide() {
+        nativeLog("SYS", "finishRide")
         // Keep the state marked completed (with a timestamp) instead of
         // deleting it, so the WebView can show the arrived UI on resume.
         if let r = ride {
@@ -218,6 +251,13 @@ final class LocationTracker: NSObject {
         r.lastFixAccuracy = accuracy
         jsEval?("if (typeof nativePosition === 'function') { try { nativePosition(\(lat),\(lng),\(Int(accuracy))); } catch(e){} }")
 
+        // Throttled GPS log for the Logs panel (1/sec max).
+        let now = Date()
+        if now.timeIntervalSince(lastGpsLogAt) >= 1.0 {
+            lastGpsLogAt = now
+            nativeLog("GPS", String(format: "fix lat=%.6f lng=%.6f acc=%dm", lat, lng, Int(accuracy)))
+        }
+
         var idx = firstUnreached(r)
         // Snap-forward ONLY at ride start (no stops reached yet).
         // Mid-ride stays strictly sequential — never reintroduce mid-ride snap.
@@ -231,6 +271,7 @@ final class LocationTracker: NSObject {
                 if d < bestDist { bestDist = d; best = i }
             }
             if best > idx && bestDist <= r.snapDistance {
+                nativeLog("STOP", "Snap forward \(idx)->\(best) (\(r.stops[best].label)) dist=\(Int(bestDist))m")
                 for i in idx..<best {
                     r.stops[i].reached = true
                     r.stops[i].skipped = true
@@ -284,6 +325,7 @@ final class LocationTracker: NSObject {
         if labelPart.hasPrefix("Stop ") { labelPart = String(labelPart.dropFirst(5)) }
         if let colonIdx = labelPart.firstIndex(of: ":") { labelPart = String(labelPart[..<colonIdx]).trimmingCharacters(in: .whitespaces) }
         let isMyStop = !myStopLabel.isEmpty && myStopLabel == labelPart
+        nativeLog("STOP", "Arrival: \(stop.label) myStop=\(isMyStop) final=\(isFinal)")
         // Per spec: device ID after emoji, e.g. "🚌 [A82] at Stop 1: Mia."
         // stop.label is like "Stop 1: Mia" (already includes name)
         let devTag = r.deviceId.isEmpty ? "" : " [" + r.deviceId + "]"
@@ -307,9 +349,12 @@ final class LocationTracker: NSObject {
                 UIApplication.shared.endBackgroundTask(taskID)
             }
             let fullMsg = msg // device ID already in message per spec
-            NtfyClient.post(topic: r.topic, message: fullMsg) {
+            NtfyClient.post(topic: r.topic, message: fullMsg) { [weak self] in
+                DispatchQueue.main.async { self?.nativeLog("NTFY", "Sent: \(fullMsg)") }
                 UIApplication.shared.endBackgroundTask(taskID)
             }
+        } else {
+            nativeLog("NTFY", "skipped followerOn=\(r.followerOn) topicSet=\(!r.topic.isEmpty)")
         }
         persist()
         pushSync(toast: "\(stop.label) reached")
@@ -383,9 +428,11 @@ extension LocationTracker: CLLocationManagerDelegate {
     func locationManager(_ manager: CLLocationManager,
                          didFailWithError error: Error) {
         // Ignore transient GPS errors; the next fix will come.
+        nativeLog("GPS", "error: \(error.localizedDescription)")
     }
 
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        nativeLog("SYS", "auth changed: \(CLLocationManager.authorizationStatus().rawValue)")
         if CLLocationManager.authorizationStatus() == .authorizedAlways,
            let cfg = pendingConfig {
             pendingConfig = nil
