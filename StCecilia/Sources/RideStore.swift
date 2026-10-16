@@ -51,6 +51,8 @@ final class RideState {
     var tab = "am"
     var topic = ""
     var deviceId = ""
+    var myStopAm = ""
+    var myStopPm = ""
     var followerOn = true
     var sound = false
     var snapDistance = 100.0
@@ -76,6 +78,10 @@ final class RideState {
         tab = json["tab"] as? String ?? "am"
         topic = json["topic"] as? String ?? ""
         deviceId = json["deviceId"] as? String ?? ""
+        if let ms = json["myStop"] as? [String: Any] {
+            myStopAm = ms["am"] as? String ?? ""
+            myStopPm = ms["pm"] as? String ?? ""
+        }
         followerOn = json["followerOn"] as? Bool ?? true
         sound = json["sound"] as? Bool ?? false
         if let d = json["snapDistance"] as? Double {
