@@ -279,7 +279,11 @@ final class LocationTracker: NSObject {
         // My Stop format: "📱 [X##] waiting at Stop 1: Mia." (AM) / "got off at" (PM)
         // Regular: "🚌 [X##] at Stop 2: Walking."
         let myStopLabel = (r.tab == "pm") ? r.myStopPm : r.myStopAm
-        let isMyStop = !myStopLabel.isEmpty && myStopLabel == stop.label
+        // stop.label is like "Stop 1: Mia" — extract just the "1" or "I"
+        var labelPart = stop.label
+        if labelPart.hasPrefix("Stop ") { labelPart = String(labelPart.dropFirst(5)) }
+        if let colonIdx = labelPart.firstIndex(of: ":") { labelPart = String(labelPart[..<colonIdx]).trimmingCharacters(in: .whitespaces) }
+        let isMyStop = !myStopLabel.isEmpty && myStopLabel == labelPart
         // Per spec: device ID after emoji, e.g. "🚌 [A82] at Stop 1: Mia."
         // stop.label is like "Stop 1: Mia" (already includes name)
         let devTag = r.deviceId.isEmpty ? "" : " [" + r.deviceId + "]"
