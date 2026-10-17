@@ -270,9 +270,12 @@ final class LocationTracker: NSObject {
                                   lat2: r.stops[i].lat, lon2: r.stops[i].lng)
                 if d < bestDist { bestDist = d; best = i }
             }
-            // Safeguard: never snap more than 3 stops ahead on startup.
+            // Safeguard: never snap more than 3 stops ahead on startup,
+            // UNLESS high-accuracy (<=30m). Precise fix near far stop = real
+            // mid-route boarding; coarse fix jumping far = cold-GPS glitch.
             let maxSkip = 3
-            if best > idx && (best - idx) > maxSkip {
+            let highAccuracy = accuracy <= 30
+            if !highAccuracy && best > idx && (best - idx) > maxSkip {
                 best = -1
             }
             if best > idx && bestDist <= r.snapDistance {
