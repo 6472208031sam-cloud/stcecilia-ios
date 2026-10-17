@@ -270,6 +270,11 @@ final class LocationTracker: NSObject {
                                   lat2: r.stops[i].lat, lon2: r.stops[i].lng)
                 if d < bestDist { bestDist = d; best = i }
             }
+            // Safeguard: never snap more than 3 stops ahead on startup.
+            let maxSkip = 3
+            if best > idx && (best - idx) > maxSkip {
+                best = -1
+            }
             if best > idx && bestDist <= r.snapDistance {
                 nativeLog("STOP", "Snap forward \(idx)->\(best) (\(r.stops[best].label)) dist=\(Int(bestDist))m")
                 for i in idx..<best {
