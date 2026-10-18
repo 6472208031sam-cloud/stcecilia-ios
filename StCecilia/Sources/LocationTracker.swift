@@ -378,7 +378,7 @@ final class LocationTracker: NSObject {
                     let devTag = r.deviceId.isEmpty ? "" : " [\(r.deviceId)]"
                     let msg = "\u{1F4F1}\(devTag) on bus, heading to \(next.label)."
                     nativeLog("NTFY", "Sending on-bus: \(msg)")
-                    sendNtfy(msg)
+                    NtfyClient.post(topic: r.topic, message: msg) { }
                 }
             }
         }
