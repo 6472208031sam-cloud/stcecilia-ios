@@ -196,7 +196,7 @@ final class LocationTracker: NSObject {
     }
 
     private func statusPayload(ride r: RideState, active: Bool) -> String {
-        let payload: [String: Any] = [
+        var payload: [String: Any] = [
             "active": active,
             "completed": r.completed,
             "page": r.page,
@@ -206,6 +206,10 @@ final class LocationTracker: NSObject {
             "next": firstUnreached(r),
             "total": r.stops.count
         ]
+        // on-bus pill for driver map: poll path must include it (like pushSync).
+        if active, let obs = onBusStop {
+            payload["onBus"] = obs
+        }
         guard let data = try? JSONSerialization.data(withJSONObject: payload),
               let s = String(data: data, encoding: .utf8) else { return "" }
         return s
