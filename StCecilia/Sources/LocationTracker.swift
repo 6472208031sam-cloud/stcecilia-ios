@@ -376,7 +376,7 @@ final class LocationTracker: NSObject {
                 if seq == 2 && stopIdx + 1 < r.stops.count {
                     let next = r.stops[stopIdx + 1]
                     let devTag = r.deviceId.isEmpty ? "" : " [\(r.deviceId)]"
-                    let msg = "\uD83D\uDCF1\(devTag) on bus, heading to \(next.label)."
+                    let msg = "\u{1F4F1}\(devTag) on bus, heading to \(next.label)."
                     nativeLog("NTFY", "Sending on-bus: \(msg)")
                     sendNtfy(msg)
                 }
