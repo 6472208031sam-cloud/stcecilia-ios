@@ -20,6 +20,7 @@ final class LocationTracker: NSObject {
     // On-bus detection (AM only)
     private var checkpointProgress: [Int: Int] = [:]
     private var lastCpLogAt: Date = .distantPast
+    private var onBusStop: String? = nil
     // On-bus detection checkpoints (AM only): 3 per stop at 50/100/150m
     // Format: (stopIdx, seq, lat, lng)
     private static let amCheckpoints: [(Int, Int, Double, Double)] = [
@@ -244,6 +245,7 @@ final class LocationTracker: NSObject {
         nearTargetIdx = -1
         checkpointProgress.removeAll()
         lastCpLogAt = .distantPast
+        onBusStop = nil
         persist()
         manager.startUpdatingLocation()
     }
@@ -379,6 +381,8 @@ final class LocationTracker: NSObject {
                     let msg = "\u{1F4F1}\(devTag) on bus, heading to \(next.label)."
                     nativeLog("NTFY", "Sending on-bus: \(msg)")
                     NtfyClient.post(topic: r.topic, message: msg) { }
+                    onBusStop = next.label
+                    pushSync(toast: nil)
                 }
             }
         }
@@ -389,6 +393,7 @@ final class LocationTracker: NSObject {
         guard let r = ride, idx < r.stops.count else { return }
         nearCount = 0
         nearTargetIdx = -1
+        onBusStop = nil
         let stop = r.stops[idx]
         stop.reached = true
         let isFinal = idx == r.stops.count - 1
@@ -480,11 +485,12 @@ final class LocationTracker: NSObject {
 
     func pushSync(toast: String?) {
         guard let r = ride else { return }
-        let payload: [String: Any] = [
+        var payload: [String: Any] = [
             "reached": r.stops.map { $0.reached },
             "skipped": r.stops.map { $0.skipped },
             "next": firstUnreached(r)
         ]
+        if let obs = onBusStop { payload["onBus"] = obs }
         guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
         let b64 = data.base64EncodedString()
         jsEval?("if (typeof nativeSync === 'function') { try { nativeSync('\(b64)',\(jsLiteral(toast))); } catch(e){} }")
