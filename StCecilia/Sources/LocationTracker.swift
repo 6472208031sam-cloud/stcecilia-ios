@@ -490,7 +490,10 @@ final class LocationTracker: NSObject {
             "skipped": r.stops.map { $0.skipped },
             "next": firstUnreached(r)
         ]
-        if let obs = onBusStop { payload["onBus"] = obs }
+        if let obs = onBusStop {
+            payload["onBus"] = obs
+            nativeLog("BUS-DETECT", "Sync includes onBus: \(obs)")
+        }
         guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
         let b64 = data.base64EncodedString()
         jsEval?("if (typeof nativeSync === 'function') { try { nativeSync('\(b64)',\(jsLiteral(toast))); } catch(e){} }")
