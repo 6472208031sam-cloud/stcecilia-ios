@@ -17,6 +17,37 @@ final class LocationTracker: NSObject {
     private var nearCount = 0
     private var nearTargetIdx = -1
     private var pendingConfig: String?
+    // On-bus detection (AM only)
+    private var checkpointProgress: [Int: Int] = [:]
+    private var lastCpLogAt: Date = .distantPast
+    // On-bus detection checkpoints (AM only): 3 per stop at 50/100/150m
+    // Format: (stopIdx, seq, lat, lng)
+    private static let amCheckpoints: [(Int, Int, Double, Double)] = [
+        (0, 0, 43.497995, -79.720251),
+        (0, 1, 43.497681, -79.719806),
+        (0, 2, 43.497368, -79.719362),
+        (1, 0, 43.497841, -79.720032),
+        (1, 1, 43.497527, -79.719588),
+        (1, 2, 43.497214, -79.719144),
+        (2, 0, 43.497267, -79.71922),
+        (2, 1, 43.496935, -79.718807),
+        (2, 2, 43.496498, -79.718691),
+        (3, 0, 43.496583, -79.718701),
+        (3, 1, 43.496377, -79.719042),
+        (3, 2, 43.496341, -79.71966),
+        (4, 0, 43.496396, -79.718709),
+        (4, 1, 43.49636, -79.719326),
+        (4, 2, 43.496326, -79.719892),
+        (5, 0, 43.496357, -79.719386),
+        (5, 1, 43.496323, -79.719951),
+        (5, 2, 43.496179, -79.720497),
+        (6, 0, 43.496286, -79.720343),
+        (6, 1, 43.49592, -79.720667),
+        (6, 2, 43.495513, -79.720933),
+        (7, 0, 43.495831, -79.720725),
+        (7, 1, 43.495425, -79.720991),
+        (7, 2, 43.495124, -79.721188),
+    ]
 
     // MARK: - Diagnostic logging (viewable from the web page's Logs panel)
     private var nativeLogs: [String] = []
@@ -211,6 +242,8 @@ final class LocationTracker: NSObject {
         guard ride != nil else { return }
         nearCount = 0
         nearTargetIdx = -1
+        checkpointProgress.removeAll()
+        lastCpLogAt = .distantPast
         persist()
         manager.startUpdatingLocation()
     }
@@ -314,6 +347,42 @@ final class LocationTracker: NSObject {
             nearCount = 0
             nearTargetIdx = -1
         }
+
+        // On-bus detection (AM only)
+        checkOnBusCheckpoints(lat: lat, lng: lng, accuracy: accuracy, ride: r)
+    }
+
+    private func checkOnBusCheckpoints(lat: Double, lng: Double, accuracy: Double, ride r: RideState) {
+        guard r.page == "am" else { return }
+        guard !Self.amCheckpoints.isEmpty else {
+            nativeLog("BUS-DETECT", "No checkpoints loaded!")
+            return
+        }
+        let now = Date()
+        let shouldLog = now.timeIntervalSince(lastCpLogAt) >= 10.0
+        for (stopIdx, seq, cpLat, cpLng) in Self.amCheckpoints {
+            guard stopIdx < r.stops.count else { continue }
+            let stop = r.stops[stopIdx]
+            guard stop.reached else { continue }
+            let prog = checkpointProgress[stopIdx] ?? 0
+            guard prog == seq else { continue }
+            let d = haversine(lat1: lat, lon1: lng, lat2: cpLat, lon2: cpLng)
+            if shouldLog {
+                nativeLog("BUS-DETECT", "Stop \(stop.label) cp\(seq+1)/3: \(Int(d))m away (need <=50m), acc=\(Int(accuracy))m")
+            }
+            if d <= 50 && accuracy <= 100 {
+                checkpointProgress[stopIdx] = seq + 1
+                nativeLog("BUS-DETECT", "Stop \(stop.label) checkpoint \(seq+1)/3 HIT (\(Int(d))m)")
+                if seq == 2 && stopIdx + 1 < r.stops.count {
+                    let next = r.stops[stopIdx + 1]
+                    let devTag = r.deviceId.isEmpty ? "" : " [\(r.deviceId)]"
+                    let msg = "\uD83D\uDCF1\(devTag) on bus, heading to \(next.label)."
+                    nativeLog("NTFY", "Sending on-bus: \(msg)")
+                    sendNtfy(msg)
+                }
+            }
+        }
+        if shouldLog { lastCpLogAt = now }
     }
 
     private func arrive(at idx: Int) {
