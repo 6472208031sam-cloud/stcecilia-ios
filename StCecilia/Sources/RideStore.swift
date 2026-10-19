@@ -51,6 +51,7 @@ final class RideState {
     var tab = "am"
     var topic = ""
     var deviceId = ""
+    var deviceLabel = ""
     var myStopAm = ""
     var myStopPm = ""
     var followerOn = true
@@ -78,6 +79,7 @@ final class RideState {
         tab = json["tab"] as? String ?? "am"
         topic = json["topic"] as? String ?? ""
         deviceId = json["deviceId"] as? String ?? ""
+        deviceLabel = json["deviceLabel"] as? String ?? ""
         if let ms = json["myStop"] as? [String: Any] {
             myStopAm = ms["am"] as? String ?? ""
             myStopPm = ms["pm"] as? String ?? ""

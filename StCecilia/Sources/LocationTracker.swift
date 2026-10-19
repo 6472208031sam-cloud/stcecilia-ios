@@ -381,7 +381,7 @@ final class LocationTracker: NSObject {
                 nativeLog("BUS-DETECT", "Stop \(stop.label) checkpoint \(seq+1)/3 HIT (\(Int(d))m)")
                 if seq == 2 && stopIdx + 1 < r.stops.count {
                     let next = r.stops[stopIdx + 1]
-                    let devTag = r.deviceId.isEmpty ? "" : " [\(r.deviceId)]"
+                    let devTag = r.deviceId.isEmpty ? "" : " [\(r.deviceId)]" + (r.deviceLabel.isEmpty ? "" : " (\(r.deviceLabel))")
                     let msg = "\u{1F4F1}\(devTag) on bus, heading to \(next.label)."
                     nativeLog("NTFY", "Sending on-bus: \(msg)")
                     NtfyClient.post(topic: r.topic, message: msg) { }
@@ -416,7 +416,7 @@ final class LocationTracker: NSObject {
         nativeLog("STOP", "Arrival: \(stop.label) myStop=\(isMyStop) final=\(isFinal)")
         // Per spec: device ID after emoji, e.g. "🚌 [A82] at Stop 1: Mia."
         // stop.label is like "Stop 1: Mia" (already includes name)
-        let devTag = r.deviceId.isEmpty ? "" : " [" + r.deviceId + "]"
+        let devTag = r.deviceId.isEmpty ? "" : " [" + r.deviceId + "]" + (r.deviceLabel.isEmpty ? "" : " (" + r.deviceLabel + ")")
         let msg: String
         let gotOff = isMyStop && r.tab == "pm"
         if isMyStop {
