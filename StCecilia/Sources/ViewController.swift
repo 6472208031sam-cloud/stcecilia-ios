@@ -86,8 +86,14 @@ class ViewController: UIViewController, WKNavigationDelegate, WKUIDelegate {
         if prompt.hasPrefix(NativeBridge.promptPrefix) {
             completionHandler(NativeBridge.shared.handle(prompt: prompt))
         } else {
-            // Not ours — mimic the default behavior.
-            completionHandler(defaultText)
+            // Not a NativeBridge call — show a real input dialog (e.g. device label).
+            let alert = UIAlertController(title: nil, message: prompt, preferredStyle: .alert)
+            alert.addTextField { tf in tf.text = defaultText }
+            alert.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in completionHandler(nil) })
+            alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in
+                completionHandler(alert.textFields?.first?.text)
+            })
+            present(alert, animated: true, completion: nil)
         }
     }
 }
