@@ -23,6 +23,7 @@ final class ScheduleManager {
     /// applyScheduleSettings() — safe to call with no active ride.
     func apply(config: RideState) {
         let tabKey = config.tab == "pm" ? "pm" : "am"
+        LocationTracker.shared.schedLog("apply tab=\(tabKey) enabled=\(config.schedEnabled) on1=\(config.schedOn1) on2=\(config.schedOn2) weekdaysOnly=\(config.schedWeekdaysOnly)")
         if let data = try? JSONSerialization.data(withJSONObject: config.toJSON()) {
             UserDefaults.standard.set(data, forKey: "stcecilia_sched_config_" + tabKey)
         }
@@ -43,30 +44,55 @@ final class ScheduleManager {
 
     /// (Re)programs the start-time notifications from stored settings.
     func schedule() {
+        LocationTracker.shared.schedLog("schedule() begin")
         removeAlarms()
         let d = UserDefaults.standard
-        guard d.bool(forKey: "stcecilia_sched_enabled") else { return }
+        let enabled = d.bool(forKey: "stcecilia_sched_enabled")
         let on1 = d.integer(forKey: "stcecilia_sched_on1")
         let on2 = d.integer(forKey: "stcecilia_sched_on2")
         let weekdaysOnly = d.bool(forKey: "stcecilia_sched_weekdays")
+        LocationTracker.shared.schedLog("stored enabled=\(enabled) on1=\(on1) on2=\(on2) weekdaysOnly=\(weekdaysOnly)")
+        guard enabled else {
+            LocationTracker.shared.schedLog("schedule SKIPPED: enabled=false")
+            return
+        }
         // Note: integer(forKey:) returns 0 when unset; fall back to defaults.
         let morning = on1 > 0 ? on1 : 480
         let afternoon = on2 > 0 ? on2 : 930
-        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        center.getNotificationSettings { settings in
+            LocationTracker.shared.schedLog("notification authorizationStatus=\(settings.authorizationStatus.rawValue) (0=notDetermined 1=denied 2=authorized 3=provisional)")
+        }
+        center.requestAuthorization(options: [.alert, .sound]) { granted, error in
+            LocationTracker.shared.schedLog("requestAuthorization granted=\(granted) error=\(error?.localizedDescription ?? "none")")
+        }
         addStartAlarm(minutes: morning, tab: "am", weekdaysOnly: weekdaysOnly, morning: true)
         addStartAlarm(minutes: afternoon, tab: "pm", weekdaysOnly: weekdaysOnly, morning: false)
+        verifyPending(after: "schedule")
+    }
+
+    /// Read-only check, ~1s later: what notifications are actually pending.
+    private func verifyPending(after label: String) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            guard let self = self else { return }
+            self.center.getPendingNotificationRequests { reqs in
+                let ids = reqs.map { $0.identifier }.filter { $0.hasPrefix(self.idPrefix) }.sorted()
+                LocationTracker.shared.schedLog("pending after \(label): count=\(ids.count) ids=\(ids.joined(separator: ","))")
+            }
+        }
     }
 
     private func removeAlarms() {
         center.getPendingNotificationRequests { [weak self] reqs in
             guard let self = self else { return }
             let ids = reqs.map { $0.identifier }.filter { $0.hasPrefix(self.idPrefix) }
+            LocationTracker.shared.schedLog("removeAlarms: found count=\(ids.count) ids=\(ids.sorted().joined(separator: ","))")
             self.center.removePendingNotificationRequests(withIdentifiers: ids)
         }
     }
 
     private func addStartAlarm(minutes: Int, tab: String,
                               weekdaysOnly: Bool, morning: Bool) {
+        LocationTracker.shared.schedLog("addStartAlarm tab=\(tab) minutes=\(minutes) weekdaysOnly=\(weekdaysOnly)")
         let content = UNMutableNotificationContent()
         content.title = "St Cecilia"
         content.body = morning
@@ -90,14 +116,26 @@ final class ScheduleManager {
                 let req = UNNotificationRequest(
                     identifier: "\(idPrefix)\(tab).\(weekday)",
                     content: content, trigger: trigger)
-                center.add(req)
+                center.add(req) { error in
+                    if let error = error {
+                        LocationTracker.shared.schedLog("add FAILED id=\(req.identifier) error=\(error.localizedDescription)")
+                    } else {
+                        LocationTracker.shared.schedLog("add OK id=\(req.identifier)")
+                    }
+                }
             }
         } else {
             let trigger = UNCalendarNotificationTrigger(dateMatching: components, repeats: true)
             let req = UNNotificationRequest(
                 identifier: "\(idPrefix)\(tab).daily",
                 content: content, trigger: trigger)
-            center.add(req)
+            center.add(req) { error in
+                if let error = error {
+                    LocationTracker.shared.schedLog("add FAILED id=\(req.identifier) error=\(error.localizedDescription)")
+                } else {
+                    LocationTracker.shared.schedLog("add OK id=\(req.identifier)")
+                }
+            }
         }
     }
 }

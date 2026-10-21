@@ -74,6 +74,16 @@ final class LocationTracker: NSObject {
         nativeLogs.removeAll()
     }
 
+    /// ScheduleManager has no log buffer of its own; route its lines here
+    /// (main-thread safe: notification callbacks arrive on other queues).
+    func schedLog(_ msg: String) {
+        if Thread.isMainThread {
+            nativeLog("SCHED", msg)
+        } else {
+            DispatchQueue.main.async { [weak self] in self?.nativeLog("SCHED", msg) }
+        }
+    }
+
     /// Set by ViewController: evaluates JS in the page.
     var jsEval: ((String) -> Void)?
     /// Called when a permission-deferred ride auto-starts.
