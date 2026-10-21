@@ -42,32 +42,78 @@ final class ScheduleManager {
         return String(data: data, encoding: .utf8)
     }
 
+    // Arming is serialized: only one remove→add pass runs at a time, and the
+    // adds are submitted inside the pending-fetch completion, immediately
+    // after the removal call — so a removal can never land after the adds it
+    // was meant to precede (the v31 logs proved that race: a re-arm while
+    // notifications were armed ended with pending count=0). Overlapping
+    // schedule() calls coalesce into one follow-up pass.
+    private var arming = false
+    private var rearmQueued = false
+    private var armCompletions: [() -> Void] = []
+
     /// (Re)programs the start-time notifications from stored settings.
-    func schedule() {
+    /// The optional completion fires once this pass has submitted its adds
+    /// (used by the background-refresh handler).
+    func schedule(completion: (() -> Void)? = nil) {
         LocationTracker.shared.schedLog("schedule() begin")
-        removeAlarms()
+        if let completion = completion { armCompletions.append(completion) }
+        if arming {
+            rearmQueued = true
+            LocationTracker.shared.schedLog("schedule: arm already in flight - follow-up pass queued")
+            return
+        }
+        arming = true
+        performSchedule()
+    }
+
+    private func performSchedule() {
         let d = UserDefaults.standard
         let enabled = d.bool(forKey: "stcecilia_sched_enabled")
         let on1 = d.integer(forKey: "stcecilia_sched_on1")
         let on2 = d.integer(forKey: "stcecilia_sched_on2")
         let weekdaysOnly = d.bool(forKey: "stcecilia_sched_weekdays")
         LocationTracker.shared.schedLog("stored enabled=\(enabled) on1=\(on1) on2=\(on2) weekdaysOnly=\(weekdaysOnly)")
-        guard enabled else {
-            LocationTracker.shared.schedLog("schedule SKIPPED: enabled=false")
-            return
-        }
-        // Note: integer(forKey:) returns 0 when unset; fall back to defaults.
+        // Note: integer(forKey:) returns 0 when unset; fall back to defaults
+        // (08:00 AM window, 15:30 PM window — same as Android).
         let morning = on1 > 0 ? on1 : 480
         let afternoon = on2 > 0 ? on2 : 930
-        center.getNotificationSettings { settings in
-            LocationTracker.shared.schedLog("notification authorizationStatus=\(settings.authorizationStatus.rawValue) (0=notDetermined 1=denied 2=authorized 3=provisional)")
+        if enabled {
+            center.getNotificationSettings { settings in
+                LocationTracker.shared.schedLog("notification authorizationStatus=\(settings.authorizationStatus.rawValue) (0=notDetermined 1=denied 2=authorized 3=provisional)")
+            }
+            center.requestAuthorization(options: [.alert, .sound]) { granted, error in
+                LocationTracker.shared.schedLog("requestAuthorization granted=\(granted) error=\(error?.localizedDescription ?? "none")")
+            }
         }
-        center.requestAuthorization(options: [.alert, .sound]) { granted, error in
-            LocationTracker.shared.schedLog("requestAuthorization granted=\(granted) error=\(error?.localizedDescription ?? "none")")
+        // Serialized remove→add: fetch what's pending, remove ours, and only
+        // then submit the new requests — all inside this one completion, in
+        // submission order.
+        center.getPendingNotificationRequests { [weak self] reqs in
+            guard let self = self else { return }
+            let ids = reqs.map { $0.identifier }.filter { $0.hasPrefix(self.idPrefix) }
+            LocationTracker.shared.schedLog("removeAlarms: found count=\(ids.count) ids=\(ids.sorted().joined(separator: ","))")
+            self.center.removePendingNotificationRequests(withIdentifiers: ids)
+            if enabled {
+                self.addStartAlarm(minutes: morning, tab: "am", weekdaysOnly: weekdaysOnly, morning: true)
+                self.addStartAlarm(minutes: afternoon, tab: "pm", weekdaysOnly: weekdaysOnly, morning: false)
+            } else {
+                LocationTracker.shared.schedLog("schedule SKIPPED adds: enabled=false (pending cleared)")
+            }
+            self.verifyPending(after: "schedule")
+            self.finishArm()
         }
-        addStartAlarm(minutes: morning, tab: "am", weekdaysOnly: weekdaysOnly, morning: true)
-        addStartAlarm(minutes: afternoon, tab: "pm", weekdaysOnly: weekdaysOnly, morning: false)
-        verifyPending(after: "schedule")
+    }
+
+    private func finishArm() {
+        arming = false
+        let completions = armCompletions
+        armCompletions.removeAll()
+        completions.forEach { $0() }
+        if rearmQueued {
+            rearmQueued = false
+            schedule()
+        }
     }
 
     /// Read-only check, ~1s later: what notifications are actually pending.
@@ -78,15 +124,6 @@ final class ScheduleManager {
                 let ids = reqs.map { $0.identifier }.filter { $0.hasPrefix(self.idPrefix) }.sorted()
                 LocationTracker.shared.schedLog("pending after \(label): count=\(ids.count) ids=\(ids.joined(separator: ","))")
             }
-        }
-    }
-
-    private func removeAlarms() {
-        center.getPendingNotificationRequests { [weak self] reqs in
-            guard let self = self else { return }
-            let ids = reqs.map { $0.identifier }.filter { $0.hasPrefix(self.idPrefix) }
-            LocationTracker.shared.schedLog("removeAlarms: found count=\(ids.count) ids=\(ids.sorted().joined(separator: ","))")
-            self.center.removePendingNotificationRequests(withIdentifiers: ids)
         }
     }
 
