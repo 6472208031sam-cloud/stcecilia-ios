@@ -411,8 +411,12 @@ final class LocationTracker: NSObject {
                     let next = r.stops[stopIdx + 1]
                     let devTag = r.deviceId.isEmpty ? "" : " [\(r.deviceId)]" + (r.deviceLabel.isEmpty ? "" : " (\(r.deviceLabel))")
                     let msg = "\u{1F4F1}\(devTag) on bus, heading to \(next.label)."
-                    nativeLog("NTFY", "Sending on-bus: \(msg)")
-                    NtfyClient.post(topic: r.topic, message: msg) { }
+                    if r.followerOn && !r.topic.isEmpty {
+                        nativeLog("NTFY", "Sending on-bus: \(msg)")
+                        NtfyClient.post(topic: r.topic, message: msg) { }
+                    } else {
+                        nativeLog("NTFY", "Suppressed on-bus (follower alerts off): \(msg)")
+                    }
                     onBusStop = next.label
                     pushSync(toast: nil)
                 }
