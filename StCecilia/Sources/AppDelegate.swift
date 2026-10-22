@@ -44,7 +44,13 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                 willPresent notification: UNNotification,
                                 withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
-        completionHandler([.banner, .sound])
+        // The ride-start confirmation is quiet by design: no foreground
+        // banner or sound — it waits in Notification Center.
+        if notification.request.identifier == LocationTracker.startNotificationID {
+            completionHandler([])
+        } else {
+            completionHandler([.banner, .sound])
+        }
     }
 
     // MARK: - Background App Refresh (schedule safety net)

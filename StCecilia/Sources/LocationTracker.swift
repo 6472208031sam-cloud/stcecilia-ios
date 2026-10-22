@@ -91,6 +91,12 @@ final class LocationTracker: NSObject {
     /// Tab requested by tapping a schedule notification.
     var pendingScheduledTab: String?
 
+    /// Quiet local ride-start confirmation (first GPS fix, with
+    /// accuracy). One fixed identifier, so a new ride's notification
+    /// replaces the previous one instead of stacking.
+    static let startNotificationID = "stc.ride.start"
+    private var startNotificationPending = false
+
     var isTracking: Bool { ride != nil }
 
     var hasBackgroundPermission: Bool {
@@ -153,6 +159,8 @@ final class LocationTracker: NSObject {
     func stopRide() {
         nativeLog("SYS", "stopRide")
         guard ride != nil else { return }
+        startNotificationPending = false
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [Self.startNotificationID])
         ride = nil
         nearCount = 0
         nearTargetIdx = -1
@@ -260,6 +268,7 @@ final class LocationTracker: NSObject {
         checkpointProgress.removeAll()
         lastCpLogAt = .distantPast
         onBusStop = nil
+        startNotificationPending = true
         persist()
         manager.startUpdatingLocation()
     }
@@ -277,6 +286,8 @@ final class LocationTracker: NSObject {
 
     private func finishRide() {
         nativeLog("SYS", "finishRide")
+        startNotificationPending = false
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [Self.startNotificationID])
         // Keep the state marked completed (with a timestamp) instead of
         // deleting it, so the WebView can show the arrived UI on resume.
         if let r = ride {
@@ -362,6 +373,13 @@ final class LocationTracker: NSObject {
         } else {
             nearCount = 0
             nearTargetIdx = -1
+        }
+
+        // Ride-start confirmation: once per ride, on the first fix, after
+        // snap/arrival processing so the counts reflect this fix.
+        if startNotificationPending {
+            startNotificationPending = false
+            if ride != nil { postStartNotification(accuracy: accuracy, ride: r) }
         }
 
         // On-bus detection (AM only)
@@ -481,6 +499,34 @@ final class LocationTracker: NSObject {
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
             AudioServicesPlaySystemSound(kSystemSoundID_Vibrate)
+        }
+    }
+
+    /// Quiet (no sound) local confirmation that tracking started, posted
+    /// on the first GPS fix so it can include the real accuracy — the iOS
+    /// counterpart of Android's foreground-service notification line.
+    /// Local only: never sent to ntfy (follower formats stay untouched).
+    private func postStartNotification(accuracy: Double, ride r: RideState) {
+        let center = UNUserNotificationCenter.current()
+        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        let content = UNMutableNotificationContent()
+        content.title = "St Cecilia"
+        let route = r.tab == "pm" ? "PM" : "AM"
+        let reached = r.stops.filter { $0.reached }.count
+        var body = "Tracking started — \(route) route · Stop \(reached) of \(r.stops.count) · ±\(Int(accuracy.rounded()))m"
+        let next = firstUnreached(r)
+        if next >= 0 { body += " · Next: \(r.stops[next].label)" }
+        content.body = body
+        content.sound = nil
+        let req = UNNotificationRequest(
+            identifier: Self.startNotificationID,
+            content: content, trigger: nil)
+        center.add(req) { error in
+            if let error = error {
+                self.nativeLog("SYS", "ride-start notification FAILED: \(error.localizedDescription)")
+            } else {
+                self.nativeLog("SYS", "ride-start notification posted: \(body)")
+            }
         }
     }
 
