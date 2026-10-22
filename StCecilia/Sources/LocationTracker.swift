@@ -96,6 +96,9 @@ final class LocationTracker: NSObject {
     /// replaces the previous one instead of stacking.
     static let startNotificationID = "stc.ride.start"
     private var startNotificationPending = false
+    /// Accuracy (rounded m) the posted start note currently shows;
+    /// a later fix that beats it re-posts the note (same identifier).
+    private var startNotificationShownAccuracy: Int? = nil
 
     var isTracking: Bool { ride != nil }
 
@@ -160,6 +163,7 @@ final class LocationTracker: NSObject {
         nativeLog("SYS", "stopRide")
         guard ride != nil else { return }
         startNotificationPending = false
+        startNotificationShownAccuracy = nil
         UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [Self.startNotificationID])
         ride = nil
         nearCount = 0
@@ -269,6 +273,7 @@ final class LocationTracker: NSObject {
         lastCpLogAt = .distantPast
         onBusStop = nil
         startNotificationPending = true
+        startNotificationShownAccuracy = nil
         persist()
         manager.startUpdatingLocation()
     }
@@ -287,6 +292,7 @@ final class LocationTracker: NSObject {
     private func finishRide() {
         nativeLog("SYS", "finishRide")
         startNotificationPending = false
+        startNotificationShownAccuracy = nil
         UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [Self.startNotificationID])
         // Keep the state marked completed (with a timestamp) instead of
         // deleting it, so the WebView can show the arrived UI on resume.
@@ -380,6 +386,12 @@ final class LocationTracker: NSObject {
         if startNotificationPending {
             startNotificationPending = false
             if ride != nil { postStartNotification(accuracy: accuracy, ride: r) }
+        } else if ride != nil, let shown = startNotificationShownAccuracy,
+                  Int(accuracy.rounded()) < shown {
+            // Accuracy beat what the start note shows: quietly re-post
+            // (same identifier) so the note tracks the best fix, like
+            // Android's live banner. No threshold \u2014 any improvement.
+            postStartNotification(accuracy: accuracy, ride: r)
         }
 
         // On-bus detection (AM only)
@@ -525,11 +537,13 @@ final class LocationTracker: NSObject {
         let req = UNNotificationRequest(
             identifier: Self.startNotificationID,
             content: content, trigger: nil)
+        let isUpdate = startNotificationShownAccuracy != nil
         center.add(req) { error in
             if let error = error {
                 self.nativeLog("SYS", "ride-start notification FAILED: \(error.localizedDescription)")
             } else {
-                self.nativeLog("SYS", "ride-start notification posted: \(body)")
+                self.startNotificationShownAccuracy = Int(accuracy.rounded())
+                self.nativeLog("SYS", "ride-start notification \(isUpdate ? "updated" : "posted"): \(body)")
             }
         }
     }
