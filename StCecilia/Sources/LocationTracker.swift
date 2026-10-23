@@ -153,6 +153,16 @@ final class LocationTracker: NSObject {
         // (safer than Android's ACTION_START, which could wipe progress with
         // the page's stale flags on a mid-ride reopen).
         applyConfig(jsonString: configJson, keepProgress: ride != nil)
+        // Phase 1 identity (shadow mode): when applyConfig merged progress
+        // from the previous ride it also carried that ride's identity over;
+        // an empty rideId here means a genuinely new ride — stamp it fresh.
+        if let r = ride, r.rideId.isEmpty {
+            r.rideId = UUID().uuidString
+            r.startedAt = Int(Date().timeIntervalSince1970 * 1000)
+            r.startSource = scheduled ? "schedule" : "manual"
+            r.routeFingerprint = r.computeFingerprint()
+            persist()
+        }
         ride?.scheduledRide = scheduled
         beginTracking()
         nativeLog("SYS", "startRide: started stops=\(ride?.stops.count ?? 0)")
@@ -170,6 +180,7 @@ final class LocationTracker: NSObject {
         nearTargetIdx = -1
         manager.stopUpdatingLocation()
         RideStore.clear()
+        nativeLog("SNAP", snapLogLine(ride: nil, state: "none"))
         jsEval?("if (typeof nativeNoRide === 'function') { try { nativeNoRide(); } catch(e){} }")
     }
 
@@ -232,9 +243,116 @@ final class LocationTracker: NSObject {
         if active, let obs = onBusStop {
             payload["onBus"] = obs
         }
+        // Phase 1 (shadow mode): the unified snapshot rides alongside the
+        // legacy fields. Nothing reads it yet; the GUI still uses the
+        // legacy fields above.
+        payload["snapshot"] = buildSnapshot(ride: r, active: active)
         guard let data = try? JSONSerialization.data(withJSONObject: payload),
               let s = String(data: data, encoding: .utf8) else { return "" }
         return s
+    }
+
+    /// Phase 1 unified ride-state snapshot (schema 1), built fresh from
+    /// the ride being served on every status call. Pure read: no state
+    /// changes. Identity fields are null until stamped (legacy rides).
+    private func buildSnapshot(ride r: RideState, active: Bool) -> [String: Any] {
+        var rideIdVal: Any = NSNull()
+        if !r.rideId.isEmpty { rideIdVal = r.rideId }
+        var startedAtVal: Any = NSNull()
+        if r.startedAt != 0 { startedAtVal = r.startedAt }
+        var startSourceVal: Any = NSNull()
+        if !r.startSource.isEmpty { startSourceVal = r.startSource }
+        var fingerprintVal: Any = NSNull()
+        if !r.routeFingerprint.isEmpty { fingerprintVal = r.routeFingerprint }
+        var nextIndex = -1
+        var nextLabelVal: Any = NSNull()
+        for i in 0..<r.stops.count {
+            if !r.stops[i].reached && !r.stops[i].skipped {
+                nextIndex = i
+                nextLabelVal = r.stops[i].label
+                break
+            }
+        }
+        var onBusVal: Any = NSNull()
+        if active, let obs = onBusStop { onBusVal = obs }
+        // lastFix only when the served ride is the live tracker ride.
+        var lastFixVal: Any = NSNull()
+        if active, self.ride === r, let t = r.lastFixTime {
+            lastFixVal = ["at": Int(t.timeIntervalSince1970 * 1000),
+                          "acc": r.lastFixAccuracy] as [String: Any]
+        }
+        var healthVal: Any = NSNull()
+        if active {
+            if let t = r.lastFixTime, Date().timeIntervalSince(t) <= 30 {
+                healthVal = "live"
+            } else {
+                healthVal = "waiting"
+            }
+        }
+        return [
+            "schema": 1,
+            "rideId": rideIdVal,
+            "revision": r.revision,
+            "state": active ? "active" : "completed",
+            "startedAt": startedAtVal,
+            "startSource": startSourceVal,
+            "route": [
+                "page": r.page,
+                "fingerprint": fingerprintVal,
+                "stops": r.stops.map { s in
+                    ["label": s.label, "name": s.name, "lat": s.lat, "lng": s.lng,
+                     "reached": s.reached, "skipped": s.skipped] as [String: Any]
+                }
+            ] as [String: Any],
+            "progress": [
+                "reached": r.stops.filter { $0.reached }.count,
+                "skipped": r.stops.filter { $0.skipped }.count,
+                "total": r.stops.count,
+                "nextIndex": nextIndex,
+                "nextLabel": nextLabelVal
+            ] as [String: Any],
+            "onBus": onBusVal,
+            "lastFix": lastFixVal,
+            "schedule": [
+                "enabled": r.schedEnabled,
+                "on1": r.schedOn1,
+                "off1": r.schedOff1,
+                "on2": r.schedOn2,
+                "off2": r.schedOff2,
+                "weekdaysOnly": r.schedWeekdaysOnly
+            ] as [String: Any],
+            "settings": [
+                "followerOn": r.followerOn,
+                "sound": r.sound,
+                "myStopAm": r.myStopAm,
+                "myStopPm": r.myStopPm,
+                "deviceId": r.deviceId
+            ] as [String: Any],
+            "updatedAt": Int(Date().timeIntervalSince1970 * 1000),
+            "health": healthVal
+        ]
+    }
+
+    /// Phase 1 SNAP log line (shadow mode). Format:
+    /// rev=<n> state=<active|completed|none> route=<page|-> fp=<fp8|->
+    /// ride=<id8|-> startedAt=<ms|-> src=<source|-> reached=<n>/<total>
+    /// next=<label|->
+    private func snapLogLine(ride r: RideState?, state: String) -> String {
+        guard let r = r else {
+            return "rev=0 state=none route=- fp=- ride=- startedAt=- src=- reached=0/0 next=-"
+        }
+        let reachedCount = r.stops.filter { $0.reached }.count
+        var nextLabel = "-"
+        for s in r.stops where !s.reached && !s.skipped {
+            nextLabel = s.label
+            break
+        }
+        let route = r.page.isEmpty ? "-" : r.page
+        let fp = r.routeFingerprint.isEmpty ? "-" : String(r.routeFingerprint.prefix(8))
+        let rid = r.rideId.isEmpty ? "-" : String(r.rideId.prefix(8))
+        let started = r.startedAt == 0 ? "-" : "\(r.startedAt)"
+        let src = r.startSource.isEmpty ? "-" : r.startSource
+        return "rev=\(r.revision) state=\(state) route=\(route) fp=\(fp) ride=\(rid) startedAt=\(started) src=\(src) reached=\(reachedCount)/\(r.stops.count) next=\(nextLabel)"
     }
 
     /// Resume a persisted ride on launch (mirrors Android's START_STICKY restart).
@@ -242,6 +360,9 @@ final class LocationTracker: NSObject {
     func restore() {
         guard let r = RideStore.load(), !r.stops.isEmpty, !r.completed else { return }
         ride = r
+        // No stamping here: identity loads with the state (a legacy state
+        // has none and keeps none).
+        nativeLog("SNAP", snapLogLine(ride: r, state: "active"))
         beginTracking()
     }
 
@@ -259,6 +380,23 @@ final class LocationTracker: NSObject {
                 cfg.stops[i].skipped = r.stops[i].skipped
             }
             cfg.scheduledRide = r.scheduledRide
+            // Same ride continuing (Phase 1): identity carries over too.
+            cfg.rideId = r.rideId
+            cfg.startedAt = r.startedAt
+            cfg.startSource = r.startSource
+            cfg.routeFingerprint = r.routeFingerprint
+            cfg.revision = r.revision
+        } else {
+            // No merge: identity must not leak in from the incoming JSON
+            // (a stored schedule config is serialized via toJSON and can
+            // carry a previous ride's identity). startRide stamps a fresh
+            // identity when it finds rideId empty; restore() never comes
+            // through here.
+            cfg.rideId = ""
+            cfg.startedAt = 0
+            cfg.startSource = ""
+            cfg.routeFingerprint = ""
+            cfg.revision = 0
         }
         ride = cfg
         ScheduleManager.shared.apply(config: cfg)
@@ -279,7 +417,11 @@ final class LocationTracker: NSObject {
     }
 
     private func persist() {
-        if let r = ride { RideStore.save(r) }
+        if let r = ride {
+            r.revision += 1
+            RideStore.save(r)
+            nativeLog("SNAP", snapLogLine(ride: r, state: r.completed ? "completed" : "active"))
+        }
     }
 
     private func firstUnreached(_ r: RideState) -> Int {
@@ -299,7 +441,9 @@ final class LocationTracker: NSObject {
         if let r = ride {
             r.completed = true
             r.completedAt = Date()
+            r.revision += 1
             RideStore.save(r)
+            nativeLog("SNAP", snapLogLine(ride: r, state: "completed"))
         }
         ride = nil
         nearCount = 0

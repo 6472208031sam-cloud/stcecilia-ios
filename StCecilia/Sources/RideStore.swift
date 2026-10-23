@@ -65,6 +65,14 @@ final class RideState {
     var schedWeekdaysOnly = true
     var scheduledRide = false
     var stops: [RideStop] = []
+    // Unified ride-state identity (Phase 1, shadow mode): stamped fresh at
+    // ride start, carried across applyConfig progress merges, persisted
+    // with the ride. Legacy states have none and keep none.
+    var rideId = ""
+    var startedAt: Int = 0          // epoch milliseconds
+    var startSource = ""            // "manual" / "schedule"
+    var routeFingerprint = ""
+    var revision = 0
     var lastFixTime: Date?
     var lastFixAccuracy: Double = -1
     /// Set when finishRide() completes the route. The persisted state is
@@ -98,6 +106,19 @@ final class RideState {
         schedOff2 = json["schedOff2"] as? Int ?? 1110
         schedWeekdaysOnly = json["schedWeekdaysOnly"] as? Bool ?? true
         scheduledRide = json["scheduledRide"] as? Bool ?? false
+        rideId = json["rideId"] as? String ?? ""
+        if let v = json["startedAt"] as? Int {
+            startedAt = v
+        } else if let v = json["startedAt"] as? Double {
+            startedAt = Int(v)
+        }
+        startSource = json["startSource"] as? String ?? ""
+        routeFingerprint = json["routeFingerprint"] as? String ?? ""
+        if let v = json["revision"] as? Int {
+            revision = v
+        } else if let v = json["revision"] as? Double {
+            revision = Int(v)
+        }
         completed = json["completed"] as? Bool ?? false
         if let ms = json["completedAt"] as? Double {
             completedAt = Date(timeIntervalSince1970: ms / 1000)
@@ -127,26 +148,70 @@ final class RideState {
             "schedOff2": schedOff2,
             "schedWeekdaysOnly": schedWeekdaysOnly,
             "scheduledRide": scheduledRide,
+            "rideId": rideId,
+            "startedAt": startedAt,
+            "startSource": startSource,
+            "routeFingerprint": routeFingerprint,
+            "revision": revision,
             "completed": completed,
             "completedAt": completedAt.map { $0.timeIntervalSince1970 * 1000 } ?? NSNull(),
             "stops": stops.map { $0.toJSON() }
         ]
     }
+
+    /// Route fingerprint (must match Android exactly): FNV-1a 64-bit over
+    /// the UTF-8 bytes of page + one "label|name|lat6|lng6" line per stop,
+    /// lines joined by "\n", rendered as 16 lowercase hex digits.
+    func computeFingerprint() -> String {
+        var lines: [String] = [page]
+        for s in stops {
+            lines.append(s.label + "|" + s.name + "|"
+                + String(format: "%.6f", s.lat) + "|"
+                + String(format: "%.6f", s.lng))
+        }
+        var h: UInt64 = 14695981039346656037
+        for b in lines.joined(separator: "\n").utf8 {
+            h ^= UInt64(b)
+            h &*= 1099511628211
+        }
+        return String(format: "%016llx", h)
+    }
 }
 
-/// Persists the active ride to UserDefaults (Android: SharedPreferences).
+/// Persists the active ride to an atomically-written file in Application
+/// Support (Phase 1 durability move off UserDefaults). Loads fall back to
+/// the legacy UserDefaults value written by older builds when no file
+/// exists yet, so a ride in progress during the upgrade still restores.
+/// clear() removes both.
 enum RideStore {
     private static let key = "stcecilia_ride_state"
 
+    private static var fileURL: URL? {
+        guard let dir = try? FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true) else { return nil }
+        return dir.appendingPathComponent(key + ".json")
+    }
+
     static func save(_ ride: RideState) {
-        if let data = try? JSONSerialization.data(withJSONObject: ride.toJSON()) {
-            UserDefaults.standard.set(data, forKey: key)
-        }
+        guard let data = try? JSONSerialization.data(withJSONObject: ride.toJSON()),
+              let url = fileURL else { return }
+        try? data.write(to: url, options: .atomic)
     }
 
     static func load() -> RideState? {
-        guard let data = UserDefaults.standard.data(forKey: key),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        if let url = fileURL, FileManager.default.fileExists(atPath: url.path) {
+            guard let data = try? Data(contentsOf: url) else { return nil }
+            return decode(data)
+        }
+        guard let data = UserDefaults.standard.data(forKey: key) else { return nil }
+        return decode(data)
+    }
+
+    private static func decode(_ data: Data) -> RideState? {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let stops = obj["stops"] as? [[String: Any]], !stops.isEmpty else {
             return nil
         }
@@ -154,6 +219,9 @@ enum RideStore {
     }
 
     static func clear() {
+        if let url = fileURL {
+            try? FileManager.default.removeItem(at: url)
+        }
         UserDefaults.standard.removeObject(forKey: key)
     }
 }
