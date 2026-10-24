@@ -17,6 +17,16 @@ final class LocationTracker: NSObject {
     private var nearCount = 0
     private var nearTargetIdx = -1
     private var pendingConfig: String?
+    // Phase 4 (observe-only): one-stop restore recovery evaluation.
+    // Armed ONLY in restore() when a persisted ride resumes after
+    // process death; evaluated once (immediately for the final-stop
+    // case, otherwise on the first fix) and only ever writes one
+    // RECOVERY log line — it never mutates ride state, never marks
+    // stops, never sends ntfy and never changes the snapshot.
+    private var recoveryArmed = false
+    private var recoveryRideId = ""
+    private var recoveryNextIdx = -1
+    private var recoveryFollowingIdx = -1
     // On-bus detection (AM only)
     private var checkpointProgress: [Int: Int] = [:]
     private var lastCpLogAt: Date = .distantPast
@@ -687,6 +697,78 @@ final class LocationTracker: NSObject {
         return "rev=\(r.revision) state=\(state) route=\(route) fp=\(fp) ride=\(rid) startedAt=\(started) src=\(src) reached=\(reachedCount)/\(r.stops.count) next=\(nextLabel)"
     }
 
+    // MARK: - Phase 4 recovery evaluation (observe-only)
+
+    /// First stop at or after `idx` that is neither reached nor skipped,
+    /// or -1 when there is none.
+    private func recoveryUnreachedIndex(_ r: RideState, from idx: Int) -> Int {
+        var i = idx
+        while i < r.stops.count {
+            if !r.stops[i].reached && !r.stops[i].skipped { return i }
+            i += 1
+        }
+        return -1
+    }
+
+    /// Arm the one-shot recovery evaluation for a ride restored in
+    /// restore(). The final-stop case (next stop N has no following
+    /// unreached stop) logs immediately here and never arms.
+    private func armRecoveryEvaluation(for r: RideState) {
+        guard !r.completed, !r.ended else { return }
+        let nextIdx = recoveryUnreachedIndex(r, from: 0)
+        guard nextIdx >= 0 else { return }
+        let followingIdx = recoveryUnreachedIndex(r, from: nextIdx + 1)
+        guard followingIdx >= 0 else {
+            nativeLog("RECOVERY", "verdict=would-not ride=\(id8(r)) route=\(r.tab) next=\(r.stops[nextIdx].label) following=- distNext=-1 distFollowing=-1 acc=-1 reason=final-stop fixSource=none")
+            return
+        }
+        recoveryArmed = true
+        recoveryRideId = r.rideId
+        recoveryNextIdx = nextIdx
+        recoveryFollowingIdx = followingIdx
+    }
+
+    /// Evaluate the armed recovery check once, on the first fix the
+    /// resumed tracker processes. Called only from
+    /// didUpdateLocations, before the invalid-accuracy guard, so a
+    /// poor/invalid first fix still logs (poor-accuracy). Disarms
+    /// before logging so it can fire exactly once. Observe-only:
+    /// reads the fix and the two stops, writes one log line, and
+    /// changes nothing else.
+    private func evaluateRecoveryIfArmed(loc: CLLocation, ride r: RideState) {
+        guard recoveryArmed else { return }
+        let armedRideId = recoveryRideId
+        let nextIdx = recoveryNextIdx
+        let followingIdx = recoveryFollowingIdx
+        recoveryArmed = false
+        recoveryRideId = ""
+        recoveryNextIdx = -1
+        recoveryFollowingIdx = -1
+        // Only the restored ride itself qualifies — a different ride
+        // started later in the same process never inherits the arm.
+        guard r.rideId == armedRideId else { return }
+        guard nextIdx >= 0, followingIdx >= 0,
+              nextIdx < r.stops.count, followingIdx < r.stops.count else { return }
+        let nextStop = r.stops[nextIdx]
+        let followingStop = r.stops[followingIdx]
+        let distNext = Int(loc.distance(from: CLLocation(latitude: nextStop.lat, longitude: nextStop.lng)))
+        let distFollowing = Int(loc.distance(from: CLLocation(latitude: followingStop.lat, longitude: followingStop.lng)))
+        let acc = Int(loc.horizontalAccuracy)
+        let verdict: String
+        let reason: String
+        if loc.horizontalAccuracy < 0 || acc > 100 {
+            verdict = "would-not"
+            reason = "poor-accuracy"
+        } else if distNext - distFollowing >= 20 {
+            verdict = "would-advance"
+            reason = "progression"
+        } else {
+            verdict = "would-not"
+            reason = "no-progression"
+        }
+        nativeLog("RECOVERY", "verdict=\(verdict) ride=\(id8(r)) route=\(r.tab) next=\(nextStop.label) following=\(followingStop.label) distNext=\(distNext) distFollowing=\(distFollowing) acc=\(acc) reason=\(reason) fixSource=first-fix")
+    }
+
     /// Resume a persisted ride on launch (mirrors Android's START_STICKY restart).
     /// A completed ride is for display only — never resume it as an active ride.
     func restore() {
@@ -695,6 +777,10 @@ final class LocationTracker: NSObject {
         reconcile()
         guard let r = RideStore.load(), !r.stops.isEmpty, !r.completed else { return }
         ride = r
+        // Phase 4 (observe-only): arm the one-shot recovery evaluation
+        // exactly here — restore() is launch-only, so this arm is
+        // inherently process-death-only. Never arm anywhere else.
+        armRecoveryEvaluation(for: r)
         // No stamping here: identity loads with the state (a legacy state
         // has none and keeps none).
         nativeLog("SNAP", snapLogLine(ride: r, state: "active"))
@@ -1118,6 +1204,11 @@ extension LocationTracker: CLLocationManagerDelegate {
     func locationManager(_ manager: CLLocationManager,
                          didUpdateLocations locations: [CLLocation]) {
         guard let loc = locations.last, let r = ride else { return }
+        // Phase 4 (observe-only): evaluate the armed restore-recovery
+        // check on this first fix, before the invalid-accuracy guard
+        // below (an invalid/poor first fix still logs poor-accuracy).
+        // handleLocation sets lastFixTime for this same fix right after.
+        evaluateRecoveryIfArmed(loc: loc, ride: r)
         // horizontalAccuracy < 0 means invalid on iOS.
         guard loc.horizontalAccuracy >= 0 else { return }
         handleLocation(loc, accuracy: loc.horizontalAccuracy, ride: r)
