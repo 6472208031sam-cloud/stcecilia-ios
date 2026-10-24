@@ -230,9 +230,13 @@ final class LocationTracker: NSObject {
             return
         }
         if subject.ended { return }
-        // Fresh-fix guard: a live ride with a fix <30s old skips (b),(d),(e).
+        // Live-ride guard: a live tracked ride (in memory) skips
+        // (b),(d),(e) regardless of fix age — a stationary phone may go
+        // minutes between fixes while its ride is genuinely still
+        // tracking. Cold state is unaffected: at launch restore()
+        // reconciles with ride == nil, so inMemory is false there.
         var skipGuarded = false
-        if inMemory, let t = subject.lastFixTime, now.timeIntervalSince(t) < 30 {
+        if inMemory {
             skipGuarded = true
         }
         // (b) Legacy active ride (no startedAt) -> ended record.
