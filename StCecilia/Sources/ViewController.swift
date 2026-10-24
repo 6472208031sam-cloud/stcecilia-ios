@@ -58,18 +58,14 @@ class ViewController: UIViewController, WKNavigationDelegate, WKUIDelegate {
         }
     }
 
-    /// Starts the ride for the tab named by a tapped schedule notification.
-    /// Returns true if a scheduled ride was started.
+    /// Thin wrapper: consumes the pending schedule-tap tab once and
+    /// delegates the currency gate + scheduled start to LocationTracker.
+    /// Returns true if the tap was handled.
     @discardableResult
     func startScheduledRideIfPending() -> Bool {
         guard let tab = LocationTracker.shared.pendingScheduledTab else { return false }
         LocationTracker.shared.pendingScheduledTab = nil
-        guard let cfg = ScheduleManager.shared.configJSON(forTab: tab),
-              LocationTracker.shared.startRide(configJson: cfg, scheduled: true) == "started"
-        else { return false }
-        eval("if (typeof nativeAutoStarted === 'function') { try { nativeAutoStarted(); } catch(e){} }")
-        LocationTracker.shared.pushSync(toast: nil)
-        return true
+        return LocationTracker.shared.handleScheduleTap(tab: tab)
     }
 
     private func eval(_ js: String) {

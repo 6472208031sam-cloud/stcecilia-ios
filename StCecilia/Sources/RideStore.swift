@@ -75,6 +75,13 @@ final class RideState {
     var revision = 0
     var lastFixTime: Date?
     var lastFixAccuracy: Double = -1
+    // Unified ride-state Phase 2: terminal "ended" marker (distinct from
+    // completed) and the async-ending flag set while a multi-step ending
+    // (got-off chain) is in flight. Round-tripped like the identity fields.
+    var ended = false
+    var endedAt: Int = 0            // epoch milliseconds
+    var endReason = ""
+    var ending = false
     /// Set when finishRide() completes the route. The persisted state is
     /// kept (not deleted) so the WebView can show the arrived UI on resume.
     var completed = false
@@ -119,6 +126,14 @@ final class RideState {
         } else if let v = json["revision"] as? Double {
             revision = Int(v)
         }
+        ended = json["ended"] as? Bool ?? false
+        if let v = json["endedAt"] as? Int {
+            endedAt = v
+        } else if let v = json["endedAt"] as? Double {
+            endedAt = Int(v)
+        }
+        endReason = json["endReason"] as? String ?? ""
+        ending = json["ending"] as? Bool ?? false
         completed = json["completed"] as? Bool ?? false
         if let ms = json["completedAt"] as? Double {
             completedAt = Date(timeIntervalSince1970: ms / 1000)
@@ -153,6 +168,10 @@ final class RideState {
             "startSource": startSource,
             "routeFingerprint": routeFingerprint,
             "revision": revision,
+            "ended": ended,
+            "endedAt": endedAt,
+            "endReason": endReason,
+            "ending": ending,
             "completed": completed,
             "completedAt": completedAt.map { $0.timeIntervalSince1970 * 1000 } ?? NSNull(),
             "stops": stops.map { $0.toJSON() }
@@ -185,6 +204,62 @@ final class RideState {
 /// clear() removes both.
 enum RideStore {
     private static let key = "stcecilia_ride_state"
+
+    private static var fileURL: URL? {
+        guard let dir = try? FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true) else { return nil }
+        return dir.appendingPathComponent(key + ".json")
+    }
+
+    static func save(_ ride: RideState) {
+        guard let data = try? JSONSerialization.data(withJSONObject: ride.toJSON()),
+              let url = fileURL else { return }
+        try? data.write(to: url, options: .atomic)
+    }
+
+    static func load() -> RideState? {
+        if let url = fileURL, FileManager.default.fileExists(atPath: url.path) {
+            guard let data = try? Data(contentsOf: url) else { return nil }
+            return decode(data)
+        }
+        guard let data = UserDefaults.standard.data(forKey: key) else { return nil }
+        return decode(data)
+    }
+
+    private static func decode(_ data: Data) -> RideState? {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let stops = obj["stops"] as? [[String: Any]], !stops.isEmpty else {
+            return nil
+        }
+        return RideState(json: obj)
+    }
+
+    static func clear() {
+        if let url = fileURL {
+            try? FileManager.default.removeItem(at: url)
+        }
+        UserDefaults.standard.removeObject(forKey: key)
+    }
+
+    /// True when persisted bytes exist (file or legacy UserDefaults),
+    /// even if they no longer decode — reconcile() quarantines that case.
+    static func storedDataExists() -> Bool {
+        if let url = fileURL, FileManager.default.fileExists(atPath: url.path) {
+            return true
+        }
+        return UserDefaults.standard.data(forKey: key) != nil
+    }
+}
+
+/// Persists the most recent ENDED ride (Phase 2), same atomic-file pattern
+/// as RideStore. An ended ride is terminal but not completed: statusJson()
+/// serves it so the page can render the ended snapshot until a fresh ride
+/// starts (fresh starts clear it) or stopRide() clears it.
+enum EndedStore {
+    private static let key = "stcecilia_ended_state"
 
     private static var fileURL: URL? {
         guard let dir = try? FileManager.default.url(

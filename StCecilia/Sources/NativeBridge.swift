@@ -41,6 +41,7 @@ final class NativeBridge {
         },
         stopRide: function() { call('stopRide'); },
         markReached: function() { call('markReached'); },
+        skipNext: function() { call('skipNext'); },
         updateConfig: function(cfg) { call('updateConfig', cfg); },
         getStatus: function() {
           var r = call('getStatus');
@@ -76,6 +77,9 @@ final class NativeBridge {
             return jsonResponse(nil)
         case "markReached":
             LocationTracker.shared.markReached()
+            return jsonResponse(nil)
+        case "skipNext":
+            LocationTracker.shared.skipNext()
             return jsonResponse(nil)
         case "updateConfig":
             LocationTracker.shared.updateConfig(configJson: arg)

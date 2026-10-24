@@ -85,6 +85,8 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
             return
         }
         LocationTracker.shared.schedLog("BG refresh fired - re-arming schedule")
+        // Phase 2: reconcile ride state before re-arming the schedule.
+        LocationTracker.shared.reconcile()
         refreshTask.expirationHandler = {
             LocationTracker.shared.schedLog("BG refresh expired before re-arm finished")
         }

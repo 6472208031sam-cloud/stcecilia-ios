@@ -124,17 +124,203 @@ final class LocationTracker: NSObject {
         }
     }
 
+    // MARK: - Toronto time helpers (Phase 2)
+
+    private var torontoCalendar: Calendar {
+        var c = Calendar(identifier: .gregorian)
+        c.timeZone = TimeZone(identifier: "America/Toronto")!
+        return c
+    }
+
+    /// "yyyy-MM-dd" in Toronto — lexicographically comparable day key.
+    func torontoDayKey(_ date: Date) -> String {
+        let c = torontoCalendar.dateComponents([.year, .month, .day], from: date)
+        return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
+    }
+
+    /// Minutes since midnight in Toronto.
+    func torontoMinutes(_ date: Date) -> Int {
+        let c = torontoCalendar.dateComponents([.hour, .minute], from: date)
+        return (c.hour ?? 0) * 60 + (c.minute ?? 0)
+    }
+
+    private func id8(_ r: RideState) -> String {
+        return String(r.rideId.prefix(8))
+    }
+
+    private func removeStartNote() {
+        startNotificationPending = false
+        startNotificationShownAccuracy = nil
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [Self.startNotificationID])
+    }
+
+    /// Teardown of the in-memory ride only (no store changes): used by
+    /// reconcile / schedule-override paths after they settle the stores.
+    private func teardownInMemory(_ subject: RideState) {
+        guard ride === subject else { return }
+        ride = nil
+        nearCount = 0
+        nearTargetIdx = -1
+        manager.stopUpdatingLocation()
+        removeStartNote()
+    }
+
+    func pushSyncIfActive() {
+        if ride != nil { pushSync(toast: nil) }
+    }
+
+    // MARK: - Settings acknowledgment (Phase 2)
+
+    private static let settingsRevKey = "stcecilia_settings_rev"
+    private static let settingsAckedKey = "stcecilia_settings_acked"
+    private static let settingsTupleKey = "stcecilia_settings_tuple"
+
+    private func settingsSignature(_ cfg: RideState) -> String {
+        return [String(cfg.followerOn), String(cfg.sound), cfg.myStopAm, cfg.myStopPm,
+                cfg.deviceId, cfg.deviceLabel, String(cfg.schedEnabled),
+                String(cfg.schedOn1), String(cfg.schedOff1), String(cfg.schedOn2),
+                String(cfg.schedOff2), String(cfg.schedWeekdaysOnly)]
+            .joined(separator: "|")
+    }
+
+    /// First updateConfig from the page is a handshake (accept + ack);
+    /// later changes bump the revision. Unchanged tuples log nothing.
+    private func acknowledgeSettings(_ cfg: RideState) {
+        let d = UserDefaults.standard
+        var rev = d.integer(forKey: Self.settingsRevKey)
+        let acked = d.bool(forKey: Self.settingsAckedKey)
+        let sig = settingsSignature(cfg)
+        let stored = d.string(forKey: Self.settingsTupleKey) ?? ""
+        if !acked {
+            d.set(true, forKey: Self.settingsAckedKey)
+            if sig != stored {
+                rev += 1
+                d.set(rev, forKey: Self.settingsRevKey)
+                d.set(sig, forKey: Self.settingsTupleKey)
+            }
+            nativeLog("SET", "handshake: page settings accepted rev=\(rev)")
+        } else if sig != stored {
+            rev += 1
+            d.set(rev, forKey: Self.settingsRevKey)
+            d.set(sig, forKey: Self.settingsTupleKey)
+            nativeLog("SET", "applied rev=\(rev)")
+        }
+    }
+
+    // MARK: - Reconcile (Phase 2)
+
+    /// Brings stored/in-memory state in line with the unified ride-state
+    /// rules. Logs ONLY when it acts (nativeLog "RECON"). Idempotent.
+    func reconcile() {
+        let now = Date()
+        let nowMs = Int(now.timeIntervalSince1970 * 1000)
+        // (a) Stored data exists but does not decode -> quarantine it.
+        if RideStore.storedDataExists(), RideStore.load() == nil {
+            RideStore.clear()
+            nativeLog("RECON", "quarantined corrupt state")
+        }
+        guard let subject = ride ?? RideStore.load() else { return }
+        let inMemory = (ride != nil && ride === subject)
+        // Housekeeping: an expired completed ride (>=15 min) is dropped
+        // silently (moved here from statusJson).
+        if subject.completed {
+            if let at = subject.completedAt, now.timeIntervalSince(at) >= 15 * 60 {
+                RideStore.clear()
+            }
+            return
+        }
+        if subject.ended { return }
+        // Fresh-fix guard: a live ride with a fix <30s old skips (b),(d),(e).
+        var skipGuarded = false
+        if inMemory, let t = subject.lastFixTime, now.timeIntervalSince(t) < 30 {
+            skipGuarded = true
+        }
+        // (b) Legacy active ride (no startedAt) -> ended record.
+        if !skipGuarded, subject.startedAt == 0 {
+            subject.ended = true
+            subject.endedAt = nowMs
+            subject.endReason = "legacy"
+            subject.revision += 1
+            EndedStore.save(subject)
+            RideStore.clear()
+            teardownInMemory(subject)
+            nativeLog("SNAP", snapLogLine(ride: subject, state: "ended"))
+            nativeLog("RECON", "ended legacy ride (no startedAt)")
+            return
+        }
+        // (c) An interrupted async ending (ending==true) is finalized.
+        if subject.ending {
+            if firstUnreached(subject) == -1 {
+                subject.ending = false
+                subject.completed = true
+                subject.completedAt = now
+                subject.revision += 1
+                RideStore.save(subject)
+                nativeLog("SNAP", snapLogLine(ride: subject, state: "completed"))
+            } else {
+                subject.ending = false
+                subject.ended = true
+                subject.endedAt = nowMs
+                subject.endReason = "ending-finalized"
+                subject.revision += 1
+                EndedStore.save(subject)
+                RideStore.clear()
+                teardownInMemory(subject)
+                nativeLog("SNAP", snapLogLine(ride: subject, state: "ended"))
+            }
+            nativeLog("RECON", "finalized interrupted ending ride=\(id8(subject))")
+            return
+        }
+        // (d) Active but every stop reached and not completed -> completed.
+        if !skipGuarded, firstUnreached(subject) == -1 {
+            subject.completed = true
+            subject.completedAt = now
+            subject.revision += 1
+            RideStore.save(subject)
+            nativeLog("SNAP", snapLogLine(ride: subject, state: "completed"))
+            nativeLog("RECON", "classified complete ride=\(id8(subject))")
+            return
+        }
+        // (e) Stale rule via the tab's latest schedule window.
+        if !skipGuarded, subject.startedAt != 0 {
+            let start = Date(timeIntervalSince1970: Double(subject.startedAt) / 1000)
+            let window = ScheduleManager.shared.latestWindow(forTab: subject.tab)
+            var reason: String? = nil
+            if torontoDayKey(start) < torontoDayKey(now) {
+                reason = "prev-day"
+            } else if window.off > window.on,
+                      torontoMinutes(start) <= window.off,
+                      torontoMinutes(now) > window.off,
+                      torontoDayKey(start) == torontoDayKey(now) {
+                reason = "window-passed"
+            }
+            if let reason = reason {
+                let rid = id8(subject)
+                let tab = subject.tab
+                RideStore.clear()
+                teardownInMemory(subject)
+                nativeLog("RECON", "discarded stale ride=\(rid) route=\(tab) reason=\(reason)")
+                return
+            }
+        }
+    }
+
     // MARK: - Bridge API (mirrors Android NativeBridge + TrackingService)
 
     /// Returns "started" / "permission_needed" / "error", exactly like Android.
+    /// Phase 2 check-first start: a live ride is never wiped by a start —
+    /// manual starts resume it, scheduled starts resync / re-tag / override
+    /// only per the rules below; a fresh ride is created only when no live
+    /// ride exists (or a scheduled start overrides a different tab).
     func startRide(configJson: String?, scheduled: Bool = false) -> String {
         nativeLog("SYS", "startRide scheduled=\(scheduled)")
         guard let configJson = configJson, !configJson.isEmpty,
               let data = configJson.data(using: .utf8),
-              (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) != nil else {
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             nativeLog("SYS", "startRide: invalid config -> error")
             return "error"
         }
+        let cfg = RideState(json: obj)
         switch CLLocationManager.authorizationStatus() {
         case .notDetermined:
             nativeLog("SYS", "startRide: permission_needed (requesting always)")
@@ -149,24 +335,131 @@ final class LocationTracker: NSObject {
             nativeLog("SYS", "startRide: permission_needed (denied/restricted)")
             return "permission_needed"
         }
-        // Already tracking: refresh config but keep the service's progress
-        // (safer than Android's ACTION_START, which could wipe progress with
-        // the page's stale flags on a mid-ride reopen).
-        applyConfig(jsonString: configJson, keepProgress: ride != nil)
-        // Phase 1 identity (shadow mode): when applyConfig merged progress
-        // from the previous ride it also carried that ride's identity over;
-        // an empty rideId here means a genuinely new ride — stamp it fresh.
-        if let r = ride, r.rideId.isEmpty {
-            r.rideId = UUID().uuidString
-            r.startedAt = Int(Date().timeIntervalSince1970 * 1000)
-            r.startSource = scheduled ? "schedule" : "manual"
-            r.routeFingerprint = r.computeFingerprint()
-            persist()
+        // Scheduled currency gate: a stale schedule event (outside
+        // [on-15, off] for its tab, Toronto minutes) starts nothing.
+        if scheduled {
+            let window = ScheduleManager.shared.latestWindow(forTab: cfg.tab)
+            let nowMin = torontoMinutes(Date())
+            if nowMin < window.on - 15 || nowMin > window.off {
+                nativeLog("SCHED", "stale event ignored page=\(cfg.tab)")
+                pushSyncIfActive()
+                return "started"
+            }
         }
-        ride?.scheduledRide = scheduled
+        reconcile()
+        var override = false
+        if let live = ride, !live.completed, !live.ended {
+            if !scheduled {
+                // Manual start over a live ride: change NOTHING, resume it.
+                nativeLog("START", "live ride exists — resuming ride=\(id8(live)) (check-first)")
+                beginTracking()
+                pushSync(toast: nil)
+                return "started"
+            }
+            if live.tab == cfg.tab {
+                // Scheduled start for the live ride's tab: resync, except a
+                // never-fixed, zero-progress, non-schedule ride is re-tagged
+                // as schedule-started.
+                if live.lastFixTime == nil, live.stops.allSatisfy({ !$0.reached && !$0.skipped }),
+                   live.startSource != "schedule" {
+                    live.startSource = "schedule"
+                    live.scheduledRide = true
+                    persist()
+                    nativeLog("SCHED", "re-tagged startSource=schedule ride=\(id8(live))")
+                }
+                pushSync(toast: nil)
+                return "started"
+            }
+            // Scheduled start for a DIFFERENT tab: end the live ride into
+            // the EndedStore, tear it down, then fall through to a fresh
+            // create that must NOT clear that ended record.
+            let old = live
+            old.ended = true
+            old.endedAt = Int(Date().timeIntervalSince1970 * 1000)
+            old.endReason = "schedule-override"
+            old.revision += 1
+            EndedStore.save(old)
+            nativeLog("SNAP", snapLogLine(ride: old, state: "ended"))
+            nativeLog("SCHED", "schedule override: ended ride=\(id8(old)) route=\(old.tab) reason=schedule-override")
+            teardownInMemory(old)
+            RideStore.clear()
+            jsEval?("if (typeof nativeNoRide === 'function') { try { nativeNoRide(); } catch(e){} }")
+            override = true
+        }
+        // Fresh create: state from cfg, ALL stop flags zeroed explicitly,
+        // identity zeroed (in applyConfig) then stamped fresh.
+        applyConfig(jsonString: configJson, keepProgress: false)
+        guard let r = ride else { return "error" }
+        for s in r.stops {
+            s.reached = false
+            s.skipped = false
+        }
+        r.rideId = UUID().uuidString
+        r.startedAt = Int(Date().timeIntervalSince1970 * 1000)
+        r.startSource = scheduled ? "schedule" : "manual"
+        r.routeFingerprint = r.computeFingerprint()
+        r.scheduledRide = scheduled
+        if !override { EndedStore.clear() }
+        persist()
         beginTracking()
         nativeLog("SYS", "startRide: started stops=\(ride?.stops.count ?? 0)")
         return "started"
+    }
+
+    /// Schedule-notification tap entry (called by ViewController's thin
+    /// wrapper): currency gate first, then a scheduled check-first start;
+    /// on success the page is told the ride auto-started and resynced.
+    func handleScheduleTap(tab: String) -> Bool {
+        reconcile()
+        let window = ScheduleManager.shared.latestWindow(forTab: tab)
+        let nowMin = torontoMinutes(Date())
+        if nowMin < window.on - 15 || nowMin > window.off {
+            nativeLog("SCHED", "stale event ignored page=\(tab)")
+            pushSyncIfActive()
+            return true
+        }
+        guard let cfg = ScheduleManager.shared.configJSON(forTab: tab),
+              startRide(configJson: cfg, scheduled: true) == "started" else {
+            return false
+        }
+        jsEval?("if (typeof nativeAutoStarted === 'function') { try { nativeAutoStarted(); } catch(e){} }")
+        pushSync(toast: nil)
+        return true
+    }
+
+    /// D7: skip the next unreached stop natively. Marks it reached+skipped
+    /// with NO arrival side-effects (no ntfy, no sound); skipping the last
+    /// unreached stop ends the ride as ENDED (reason "skip-final").
+    func skipNext() {
+        guard let r = ride else {
+            nativeLog("SKIP", "no-op (no active ride)")
+            return
+        }
+        guard let idx = r.stops.firstIndex(where: { !$0.reached && !$0.skipped }) else {
+            nativeLog("SKIP", "no-op (no unreached stop)")
+            return
+        }
+        r.stops[idx].reached = true
+        r.stops[idx].skipped = true
+        persist()
+        nativeLog("SKIP", "skipped next stop \(r.stops[idx].label) ride=\(id8(r))")
+        if firstUnreached(r) == -1 {
+            r.ended = true
+            r.endedAt = Int(Date().timeIntervalSince1970 * 1000)
+            r.endReason = "skip-final"
+            r.revision += 1
+            EndedStore.save(r)
+            RideStore.clear()
+            ride = nil
+            nearCount = 0
+            nearTargetIdx = -1
+            manager.stopUpdatingLocation()
+            removeStartNote()
+            nativeLog("SNAP", snapLogLine(ride: r, state: "ended"))
+            jsEval?("if (typeof nativeNoRide === 'function') { try { nativeNoRide(); } catch(e){} }")
+        } else {
+            pushSync(toast: nil)
+        }
     }
 
     func stopRide() {
@@ -180,6 +473,7 @@ final class LocationTracker: NSObject {
         nearTargetIdx = -1
         manager.stopUpdatingLocation()
         RideStore.clear()
+        EndedStore.clear()
         nativeLog("SNAP", snapLogLine(ride: nil, state: "none"))
         jsEval?("if (typeof nativeNoRide === 'function') { try { nativeNoRide(); } catch(e){} }")
     }
@@ -201,11 +495,30 @@ final class LocationTracker: NSObject {
             return
         }
         let cfg = RideState(json: obj)
-        // Always refresh the schedule (must survive with no active ride),
-        // stop data only applies to a live ride — mirrors Android ACTION_UPDATE.
+        // Settings acknowledgment runs BEFORE anything is applied.
+        acknowledgeSettings(cfg)
+        // Always refresh the schedule (must survive with no active ride).
         ScheduleManager.shared.apply(config: cfg)
-        if ride != nil {
-            applyConfig(jsonString: configJson, keepProgress: true)
+        if let r = ride {
+            // §5: during a ride ONLY settings fields are copied into the
+            // live ride — never tab/page/stops/progress/identity/
+            // scheduledRide — so a page reopen can never move the route.
+            r.followerOn = cfg.followerOn
+            r.sound = cfg.sound
+            r.myStopAm = cfg.myStopAm
+            r.myStopPm = cfg.myStopPm
+            r.deviceId = cfg.deviceId
+            r.deviceLabel = cfg.deviceLabel
+            r.topic = cfg.topic
+            r.snapDistance = cfg.snapDistance
+            r.schedEnabled = cfg.schedEnabled
+            r.schedOn1 = cfg.schedOn1
+            r.schedOff1 = cfg.schedOff1
+            r.schedOn2 = cfg.schedOn2
+            r.schedOff2 = cfg.schedOff2
+            r.schedWeekdaysOnly = cfg.schedWeekdaysOnly
+            persist()
+            nativeLog("CFG", "settings applied during ride (route unchanged)")
             pushSync(toast: nil)
         }
     }
@@ -215,6 +528,7 @@ final class LocationTracker: NSObject {
     /// active=false so the page can show the arrived UI after a background
     /// finish. Shape mirrors Android's getStatusJson().
     func statusJson() -> String {
+        reconcile()
         if let r = ride, !r.stops.isEmpty {
             return statusPayload(ride: r, active: true)
         }
@@ -222,8 +536,11 @@ final class LocationTracker: NSObject {
             if let at = r.completedAt, Date().timeIntervalSince(at) < 15 * 60 {
                 return statusPayload(ride: r, active: false)
             }
-            // Expired: drop it so a fresh page shows no ride.
+            // Expired (reconcile's housekeeping normally clears this first).
             RideStore.clear()
+        }
+        if let e = EndedStore.load(), !e.stops.isEmpty, e.ended {
+            return statusPayload(ride: e, active: false)
         }
         return ""
     }
@@ -239,6 +556,9 @@ final class LocationTracker: NSObject {
             "next": firstUnreached(r),
             "total": r.stops.count
         ]
+        if r.ended {
+            payload["ended"] = true
+        }
         // on-bus pill for driver map: poll path must include it (like pushSync).
         if active, let obs = onBusStop {
             payload["onBus"] = obs
@@ -289,15 +609,16 @@ final class LocationTracker: NSObject {
                 healthVal = "waiting"
             }
         }
-        return [
+        var snap: [String: Any] = [
             "schema": 1,
             "rideId": rideIdVal,
             "revision": r.revision,
-            "state": active ? "active" : "completed",
+            "state": r.ended ? "ended" : (active ? "active" : "completed"),
             "startedAt": startedAtVal,
             "startSource": startSourceVal,
             "route": [
                 "page": r.page,
+                "tab": r.tab,
                 "fingerprint": fingerprintVal,
                 "stops": r.stops.map { s in
                     ["label": s.label, "name": s.name, "lat": s.lat, "lng": s.lng,
@@ -326,11 +647,18 @@ final class LocationTracker: NSObject {
                 "sound": r.sound,
                 "myStopAm": r.myStopAm,
                 "myStopPm": r.myStopPm,
-                "deviceId": r.deviceId
+                "deviceId": r.deviceId,
+                "settingsRev": UserDefaults.standard.integer(forKey: Self.settingsRevKey),
+                "settingsAcked": UserDefaults.standard.bool(forKey: Self.settingsAckedKey)
             ] as [String: Any],
             "updatedAt": Int(Date().timeIntervalSince1970 * 1000),
             "health": healthVal
         ]
+        if r.ended {
+            snap["endedAt"] = r.endedAt
+            snap["endReason"] = r.endReason
+        }
+        return snap
     }
 
     /// Phase 1 SNAP log line (shadow mode). Format:
@@ -358,6 +686,9 @@ final class LocationTracker: NSObject {
     /// Resume a persisted ride on launch (mirrors Android's START_STICKY restart).
     /// A completed ride is for display only — never resume it as an active ride.
     func restore() {
+        // Phase 2: reconcile the stored state before anything resumes it —
+        // a stale / legacy / interrupted-ending ride never comes back live.
+        reconcile()
         guard let r = RideStore.load(), !r.stops.isEmpty, !r.completed else { return }
         ride = r
         // No stamping here: identity loads with the state (a legacy state
@@ -630,16 +961,55 @@ final class LocationTracker: NSObject {
                 DispatchQueue.main.async { self?.nativeLog("NTFY", "Sent: \(fullMsg)") }
                 UIApplication.shared.endBackgroundTask(taskID)
                 // Auto-stop on "got off" (PM My Stop): journey done.
+                // §7 async ending: the got-off post has landed, so mark the
+                // ride ending=true BEFORE the off-bus post; if the app dies
+                // mid-chain, reconcile() finalizes the interrupted ending.
                 if gotOff {
-                    let offMsg = "📱\(devTag) off bus. Tracking stopped."
-                    var offTaskID: UIBackgroundTaskIdentifier = .invalid
-                    offTaskID = UIApplication.shared.beginBackgroundTask(withName: "ntfy-offbus") {
-                        UIApplication.shared.endBackgroundTask(offTaskID)
-                    }
-                    NtfyClient.post(topic: r.topic, message: offMsg) { [weak self] in
-                        DispatchQueue.main.async { self?.nativeLog("NTFY", "Sent: \(offMsg)") }
-                        UIApplication.shared.endBackgroundTask(offTaskID)
-                        DispatchQueue.main.async { self?.finishRide() }
+                    DispatchQueue.main.async {
+                        guard let self = self else { return }
+                        r.ending = true
+                        if self.ride === r {
+                            self.persist()
+                        } else {
+                            r.revision += 1
+                            RideStore.save(r)
+                        }
+                        let endingRideId = r.rideId
+                        let endingRevision = r.revision
+                        let offMsg = "📱\(devTag) off bus. Tracking stopped."
+                        var offTaskID: UIBackgroundTaskIdentifier = .invalid
+                        offTaskID = UIApplication.shared.beginBackgroundTask(withName: "ntfy-offbus") {
+                            UIApplication.shared.endBackgroundTask(offTaskID)
+                        }
+                        NtfyClient.post(topic: r.topic, message: offMsg) { [weak self] in
+                            DispatchQueue.main.async { self?.nativeLog("NTFY", "Sent: \(offMsg)") }
+                            UIApplication.shared.endBackgroundTask(offTaskID)
+                            DispatchQueue.main.async {
+                                guard let self = self else { return }
+                                // Finalize ENDED only if the live ride is
+                                // still exactly the one that was ending.
+                                guard let cur = self.ride, cur === r,
+                                      cur.rideId == endingRideId,
+                                      cur.revision == endingRevision else {
+                                    self.nativeLog("SYS", "got-off finalize skipped (state changed)")
+                                    return
+                                }
+                                cur.ending = false
+                                cur.ended = true
+                                cur.endedAt = Int(Date().timeIntervalSince1970 * 1000)
+                                cur.endReason = "got-off"
+                                cur.revision += 1
+                                EndedStore.save(cur)
+                                RideStore.clear()
+                                self.ride = nil
+                                self.nearCount = 0
+                                self.nearTargetIdx = -1
+                                self.manager.stopUpdatingLocation()
+                                self.removeStartNote()
+                                self.nativeLog("SNAP", self.snapLogLine(ride: cur, state: "ended"))
+                                self.jsEval?("if (typeof nativeNoRide === 'function') { try { nativeNoRide(); } catch(e){} }")
+                            }
+                        }
                     }
                 }
             }

@@ -30,9 +30,43 @@ final class ScheduleManager {
         let d = UserDefaults.standard
         d.set(config.schedEnabled, forKey: "stcecilia_sched_enabled")
         d.set(config.schedOn1, forKey: "stcecilia_sched_on1")
+        d.set(config.schedOff1, forKey: "stcecilia_sched_off1")
         d.set(config.schedOn2, forKey: "stcecilia_sched_on2")
+        d.set(config.schedOff2, forKey: "stcecilia_sched_off2")
         d.set(config.schedWeekdaysOnly, forKey: "stcecilia_sched_weekdays")
+        LocationTracker.shared.schedLog("apply persisted off1=\(config.schedOff1) off2=\(config.schedOff2)")
         schedule()
+    }
+
+    /// The latest schedule window for a tab (Toronto minutes since
+    /// midnight): am -> (on1, off1), pm -> (on2, off2). A stored 0 means
+    /// unset, so fall back to the per-tab config JSON's sched fields,
+    /// then to the defaults (am 480/600, pm 930/1110).
+    func latestWindow(forTab tab: String) -> (on: Int, off: Int) {
+        let d = UserDefaults.standard
+        var cfgOn: Int? = nil
+        var cfgOff: Int? = nil
+        if let json = configJSON(forTab: tab),
+           let data = json.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if tab == "pm" {
+                cfgOn = obj["schedOn2"] as? Int
+                cfgOff = obj["schedOff2"] as? Int
+            } else {
+                cfgOn = obj["schedOn1"] as? Int
+                cfgOff = obj["schedOff1"] as? Int
+            }
+        }
+        if tab == "pm" {
+            let on = d.integer(forKey: "stcecilia_sched_on2")
+            let off = d.integer(forKey: "stcecilia_sched_off2")
+            return (on: on > 0 ? on : (cfgOn ?? 930),
+                    off: off > 0 ? off : (cfgOff ?? 1110))
+        }
+        let on = d.integer(forKey: "stcecilia_sched_on1")
+        let off = d.integer(forKey: "stcecilia_sched_off1")
+        return (on: on > 0 ? on : (cfgOn ?? 480),
+                off: off > 0 ? off : (cfgOff ?? 600))
     }
 
     /// Full config JSON last saved for a tab ("am"/"pm").
