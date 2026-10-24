@@ -82,6 +82,11 @@ final class RideState {
     var endedAt: Int = 0            // epoch milliseconds
     var endReason = ""
     var ending = false
+    // Phase 4 ENABLE: one recovery credit per ride, persisted with the
+    // ride state so it survives process death. Fresh rides start with
+    // credit available; a persisted v41 ride has no such field in its
+    // JSON and decodes (below) to available.
+    var recoveryCreditAvailable = true
     /// Set when finishRide() completes the route. The persisted state is
     /// kept (not deleted) so the WebView can show the arrived UI on resume.
     var completed = false
@@ -134,6 +139,8 @@ final class RideState {
         }
         endReason = json["endReason"] as? String ?? ""
         ending = json["ending"] as? Bool ?? false
+        // Missing field (v41-persisted ride) -> credit available.
+        recoveryCreditAvailable = json["recoveryCreditAvailable"] as? Bool ?? true
         completed = json["completed"] as? Bool ?? false
         if let ms = json["completedAt"] as? Double {
             completedAt = Date(timeIntervalSince1970: ms / 1000)
@@ -172,6 +179,7 @@ final class RideState {
             "endedAt": endedAt,
             "endReason": endReason,
             "ending": ending,
+            "recoveryCreditAvailable": recoveryCreditAvailable,
             "completed": completed,
             "completedAt": completedAt.map { $0.timeIntervalSince1970 * 1000 } ?? NSNull(),
             "stops": stops.map { $0.toJSON() }

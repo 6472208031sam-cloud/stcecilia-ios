@@ -17,12 +17,13 @@ final class LocationTracker: NSObject {
     private var nearCount = 0
     private var nearTargetIdx = -1
     private var pendingConfig: String?
-    // Phase 4 (observe-only): one-stop restore recovery evaluation.
+    // Phase 4 ENABLE: one-stop restore recovery evaluation.
     // Armed ONLY in restore() when a persisted ride resumes after
-    // process death; evaluated once (immediately for the final-stop
-    // case, otherwise on the first fix) and only ever writes one
-    // RECOVERY log line — it never mutates ride state, never marks
-    // stops, never sends ntfy and never changes the snapshot.
+    // process death; evaluated once (immediately for the final-stop /
+    // no-established-position cases, otherwise on the first FRESH
+    // fix) and writes one RECOVERY log line. On a progression verdict
+    // with credit available it applies ONE silent skip of stop N
+    // (verdict=advanced); it never sends ntfy for that skip.
     private var recoveryArmed = false
     private var recoveryRideId = ""
     private var recoveryNextIdx = -1
@@ -408,6 +409,8 @@ final class LocationTracker: NSObject {
             s.reached = false
             s.skipped = false
         }
+        // Phase 4 ENABLE: a fresh ride starts with recovery credit available.
+        r.recoveryCreditAvailable = true
         r.rideId = UUID().uuidString
         r.startedAt = Int(Date().timeIntervalSince1970 * 1000)
         r.startSource = scheduled ? "schedule" : "manual"
@@ -697,7 +700,7 @@ final class LocationTracker: NSObject {
         return "rev=\(r.revision) state=\(state) route=\(route) fp=\(fp) ride=\(rid) startedAt=\(started) src=\(src) reached=\(reachedCount)/\(r.stops.count) next=\(nextLabel)"
     }
 
-    // MARK: - Phase 4 recovery evaluation (observe-only)
+    // MARK: - Phase 4 recovery evaluation (ENABLED)
 
     /// First stop at or after `idx` that is neither reached nor skipped,
     /// or -1 when there is none.
@@ -711,13 +714,27 @@ final class LocationTracker: NSObject {
     }
 
     /// Arm the one-shot recovery evaluation for a ride restored in
-    /// restore(). The final-stop case (next stop N has no following
-    /// unreached stop) logs immediately here and never arms.
+    /// restore(). Judge order at restore: (a) established-position
+    /// guard — if NO stop is already passed (reached or skipped) the
+    /// verdict is logged immediately here (no-established-position)
+    /// and nothing arms; (b) else the final-stop case (next stop N
+    /// has no following unreached stop) logs immediately here and
+    /// never arms; otherwise the evaluation arms for the first
+    /// fresh fix.
     private func armRecoveryEvaluation(for r: RideState) {
         guard !r.completed, !r.ended else { return }
         let nextIdx = recoveryUnreachedIndex(r, from: 0)
         guard nextIdx >= 0 else { return }
         let followingIdx = recoveryUnreachedIndex(r, from: nextIdx + 1)
+        // (a) Established-position guard: at least one stop must
+        // already be passed at restore.
+        let hasPassed = r.stops.contains { $0.reached || $0.skipped }
+        guard hasPassed else {
+            let followingLabel = followingIdx >= 0 ? r.stops[followingIdx].label : "-"
+            nativeLog("RECOVERY", "verdict=would-not ride=\(id8(r)) route=\(r.tab) next=\(r.stops[nextIdx].label) following=\(followingLabel) distNext=-1 distFollowing=-1 acc=-1 reason=no-established-position fixSource=none")
+            return
+        }
+        // (b) Final-stop case.
         guard followingIdx >= 0 else {
             nativeLog("RECOVERY", "verdict=would-not ride=\(id8(r)) route=\(r.tab) next=\(r.stops[nextIdx].label) following=- distNext=-1 distFollowing=-1 acc=-1 reason=final-stop fixSource=none")
             return
@@ -728,15 +745,22 @@ final class LocationTracker: NSObject {
         recoveryFollowingIdx = followingIdx
     }
 
-    /// Evaluate the armed recovery check once, on the first fix the
-    /// resumed tracker processes. Called only from
+    /// Evaluate the armed recovery check once, on the first FRESH
+    /// fix the resumed tracker processes. Called only from
     /// didUpdateLocations, before the invalid-accuracy guard, so a
-    /// poor/invalid first fix still logs (poor-accuracy). Disarms
-    /// before logging so it can fire exactly once. Observe-only:
-    /// reads the fix and the two stops, writes one log line, and
-    /// changes nothing else.
+    /// poor/invalid first fresh fix still logs (poor-accuracy).
+    /// Freshness: a fix whose own CLLocation.timestamp is more than
+    /// 30s old is IGNORED — the evaluation stays armed and waits for
+    /// the first fresh fix. Disarms before logging/applying so it
+    /// can fire exactly once. On progression with credit available
+    /// it APPLIES one silent skip of stop N (verdict=advanced) and
+    /// returns; didUpdateLocations then continues processing this
+    /// same fix through handleLocation against the NEW next stop.
     private func evaluateRecoveryIfArmed(loc: CLLocation, ride r: RideState) {
         guard recoveryArmed else { return }
+        // Fix freshness (<=30s old): stale cached fixes are ignored
+        // and the evaluation stays armed — checked BEFORE disarming.
+        guard Date().timeIntervalSince(loc.timestamp) <= 30 else { return }
         let armedRideId = recoveryRideId
         let nextIdx = recoveryNextIdx
         let followingIdx = recoveryFollowingIdx
@@ -754,14 +778,53 @@ final class LocationTracker: NSObject {
         let distNext = Int(loc.distance(from: CLLocation(latitude: nextStop.lat, longitude: nextStop.lng)))
         let distFollowing = Int(loc.distance(from: CLLocation(latitude: followingStop.lat, longitude: followingStop.lng)))
         let acc = Int(loc.horizontalAccuracy)
-        let verdict: String
-        let reason: String
+        var verdict: String
+        var reason: String
         if loc.horizontalAccuracy < 0 || acc > 100 {
             verdict = "would-not"
             reason = "poor-accuracy"
         } else if distNext - distFollowing >= 20 {
-            verdict = "would-advance"
-            reason = "progression"
+            if !r.recoveryCreditAvailable {
+                // Progression judged but the one credit is spent:
+                // log would-advance/credit-spent, apply NOTHING
+                // (the one-shot is still consumed — disarmed above).
+                verdict = "would-advance"
+                reason = "credit-spent"
+            } else if recoveryUnreachedIndex(r, from: 0) != nextIdx
+                        || r.stops[followingIdx].reached || r.stops[followingIdx].skipped {
+                // Safety re-check at apply time: N must still be the
+                // first unpassed stop and the captured following stop
+                // must still be unpassed. If not, do NOT apply (this
+                // is a deviation from the armed state) — log the
+                // unapplied progression verdict.
+                verdict = "would-advance"
+                reason = "progression"
+            } else {
+                // APPLY the one-stop advance. The marking is exactly
+                // skipNext()'s core marking (LocationTracker.skipNext:
+                // reached=true + skipped=true, then persist) inlined —
+                // skipNext() itself is NOT called, so its skip-final
+                // ENDED branch can never fire here; it also cannot
+                // apply on the merits, because the captured following
+                // stop was just re-verified unpassed, so a stop still
+                // remains after N. Passed-but-silent: arrive() is not
+                // called, so there is NO arrival popup/notification,
+                // NO arrival ntfy, NO My Stop waiting/got-off event
+                // and NO on-bus synthesis for N — only the two flag
+                // assignments below, the credit spend, and persist()
+                // (revision bump + RideStore save + SNAP line), plus
+                // a silent pushSync (toast=nil) like skipNext's
+                // non-final branch so the page mirrors the snapshot.
+                r.stops[nextIdx].reached = true
+                r.stops[nextIdx].skipped = true
+                // Spend the ride's one recovery credit (persisted
+                // with the ride state by the persist() below).
+                r.recoveryCreditAvailable = false
+                persist()
+                pushSync(toast: nil)
+                verdict = "advanced"
+                reason = "progression"
+            }
         } else {
             verdict = "would-not"
             reason = "no-progression"
@@ -777,7 +840,7 @@ final class LocationTracker: NSObject {
         reconcile()
         guard let r = RideStore.load(), !r.stops.isEmpty, !r.completed else { return }
         ride = r
-        // Phase 4 (observe-only): arm the one-shot recovery evaluation
+        // Phase 4 ENABLE: arm the one-shot recovery evaluation
         // exactly here — restore() is launch-only, so this arm is
         // inherently process-death-only. Never arm anywhere else.
         armRecoveryEvaluation(for: r)
@@ -807,6 +870,8 @@ final class LocationTracker: NSObject {
             cfg.startSource = r.startSource
             cfg.routeFingerprint = r.routeFingerprint
             cfg.revision = r.revision
+            // Same ride continuing: its recovery credit carries over.
+            cfg.recoveryCreditAvailable = r.recoveryCreditAvailable
         } else {
             // No merge: identity must not leak in from the incoming JSON
             // (a stored schedule config is serialized via toJSON and can
@@ -818,6 +883,9 @@ final class LocationTracker: NSObject {
             cfg.startSource = ""
             cfg.routeFingerprint = ""
             cfg.revision = 0
+            // No merge: recovery credit must not leak in from the
+            // incoming JSON either — a fresh ride has credit available.
+            cfg.recoveryCreditAvailable = true
         }
         ride = cfg
         ScheduleManager.shared.apply(config: cfg)
@@ -927,10 +995,10 @@ final class LocationTracker: NSObject {
         let limit = stop.acc ?? 50
         if distance <= stop.radius && accuracy <= limit {
             // Tier 1: confident fix — arrive immediately.
-            arrive(at: idx)
+            arrive(at: idx, genuineGps: true)
         } else if distance <= 15 && accuracy <= 150 {
             // Very close to the pin — trust it even with moderate accuracy.
-            arrive(at: idx)
+            arrive(at: idx, genuineGps: true)
         } else if accuracy <= 200 && distance <= stop.radius + accuracy {
             // Tier 2: poor accuracy (phone pocketed) — 3 consecutive fixes
             // near the stop confirm the arrival. A GPS jump won't persist.
@@ -939,7 +1007,7 @@ final class LocationTracker: NSObject {
             if nearCount >= 3 {
                 nearCount = 0
                 nearTargetIdx = -1
-                arrive(at: idx)
+                arrive(at: idx, genuineGps: true)
             }
         } else {
             nearCount = 0
@@ -1002,13 +1070,21 @@ final class LocationTracker: NSObject {
         if shouldLog { lastCpLogAt = now }
     }
 
-    private func arrive(at idx: Int) {
+    /// `genuineGps` is true ONLY for the three arrival call sites in
+    /// handleLocation (a real GPS fix in normal sequential processing).
+    /// markReached() calls with the default false; skipNext(),
+    /// snap-forward and the recovery advance never call arrive() at all.
+    private func arrive(at idx: Int, genuineGps: Bool = false) {
         guard let r = ride, idx < r.stops.count else { return }
         nearCount = 0
         nearTargetIdx = -1
         onBusStop = nil
         let stop = r.stops[idx]
         stop.reached = true
+        // Phase 4 ENABLE: a genuine GPS arrival REGAINS the ride's
+        // recovery credit (persisted by this function's persist()
+        // below). No other marking path regains it.
+        if genuineGps { r.recoveryCreditAvailable = true }
         let isFinal = idx == r.stops.count - 1
         if r.sound { AlertPlayer.shared.play() }
         vibrate()
@@ -1204,10 +1280,12 @@ extension LocationTracker: CLLocationManagerDelegate {
     func locationManager(_ manager: CLLocationManager,
                          didUpdateLocations locations: [CLLocation]) {
         guard let loc = locations.last, let r = ride else { return }
-        // Phase 4 (observe-only): evaluate the armed restore-recovery
-        // check on this first fix, before the invalid-accuracy guard
-        // below (an invalid/poor first fix still logs poor-accuracy).
-        // handleLocation sets lastFixTime for this same fix right after.
+        // Phase 4 ENABLE: evaluate the armed restore-recovery
+        // check on this first fresh fix, before the invalid-accuracy
+        // guard below (an invalid/poor first fresh fix still logs
+        // poor-accuracy). If an advance is applied, handleLocation
+        // below continues processing this same fix against the NEW
+        // next stop. handleLocation sets lastFixTime right after.
         evaluateRecoveryIfArmed(loc: loc, ride: r)
         // horizontalAccuracy < 0 means invalid on iOS.
         guard loc.horizontalAccuracy >= 0 else { return }
