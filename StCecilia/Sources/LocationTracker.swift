@@ -491,9 +491,7 @@ final class LocationTracker: NSObject {
         }
         let now = Date()
         if d.bool(forKey: "stcecilia_sched_weekdays") {
-            var cal = Calendar(identifier: .gregorian)
-            cal.timeZone = torontoTimeZone
-            let wd = cal.component(.weekday, from: now)
+            let wd = torontoCalendar.component(.weekday, from: now)
             if wd == 1 || wd == 7 {
                 nativeLog("SCHED", "activation (\(source)): skip - weekend, weekdays-only")
                 return
