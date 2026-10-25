@@ -235,7 +235,7 @@ final class LocationTracker: NSObject {
         // Housekeeping: an expired completed ride (>=15 min) is dropped
         // silently (moved here from statusJson).
         if subject.completed {
-            if let at = subject.completedAt, now.timeIntervalSince(at) >= 15 * 60 {
+            if let at = subject.completedAt, now.timeIntervalSince(at) >= 60 {
                 RideStore.clear()
             }
             return
@@ -550,7 +550,7 @@ final class LocationTracker: NSObject {
             return statusPayload(ride: r, active: true)
         }
         if let r = RideStore.load(), !r.stops.isEmpty, r.completed {
-            if let at = r.completedAt, Date().timeIntervalSince(at) < 15 * 60 {
+            if let at = r.completedAt, Date().timeIntervalSince(at) < 60 {
                 return statusPayload(ride: r, active: false)
             }
             // Expired (reconcile's housekeeping normally clears this first).
