@@ -18,6 +18,10 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
         // Resume a persisted ride if the app was terminated mid-ride
         // (mirrors Android's START_STICKY service restart).
         LocationTracker.shared.restore()
+        // Scheduled-start rescue (v44): if a scheduled occurrence is
+        // current, start it natively BEFORE the page loads, so the page
+        // adopts the scheduled ride instead of auto-starting a manual one.
+        LocationTracker.shared.checkScheduleOnActivation(source: "launch")
         window = UIWindow(frame: UIScreen.main.bounds)
         window?.rootViewController = ViewController()
         window?.makeKeyAndVisible()
@@ -94,6 +98,12 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
             scheduleAppRefresh()
             refreshTask.setTaskCompleted(success: true)
         }
+    }
+
+    func applicationWillEnterForeground(_ application: UIApplication) {
+        // Warm reopen inside a schedule window rescues a missed banner:
+        // same activation check as launch (logs a verdict either way).
+        LocationTracker.shared.checkScheduleOnActivation(source: "foreground")
     }
 
     func applicationDidEnterBackground(_ application: UIApplication) {

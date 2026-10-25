@@ -271,6 +271,7 @@ final class LocationTracker: NSObject {
                 subject.completedAt = now
                 subject.revision += 1
                 RideStore.save(subject)
+                if subject.scheduledRide { markSchedConsumed(page: subject.tab) }
                 nativeLog("SNAP", snapLogLine(ride: subject, state: "completed"))
             } else {
                 subject.ending = false
@@ -292,6 +293,7 @@ final class LocationTracker: NSObject {
             subject.completedAt = now
             subject.revision += 1
             RideStore.save(subject)
+            if subject.scheduledRide { markSchedConsumed(page: subject.tab) }
             nativeLog("SNAP", snapLogLine(ride: subject, state: "completed"))
             nativeLog("RECON", "classified complete ride=\(id8(subject))")
             return
@@ -389,6 +391,7 @@ final class LocationTracker: NSObject {
             // the EndedStore, tear it down, then fall through to a fresh
             // create that must NOT clear that ended record.
             let old = live
+            if old.scheduledRide { markSchedConsumed(page: old.tab) }
             old.ended = true
             old.endedAt = Int(Date().timeIntervalSince1970 * 1000)
             old.endReason = "schedule-override"
@@ -439,9 +442,81 @@ final class LocationTracker: NSObject {
               startRide(configJson: cfg, scheduled: true) == "started" else {
             return false
         }
+        if let r = ride, r.scheduledRide, r.tab == tab {
+            markSchedConsumed(page: tab)
+        }
         jsEval?("if (typeof nativeAutoStarted === 'function') { try { nativeAutoStarted(); } catch(e){} }")
         pushSync(toast: nil)
         return true
+    }
+
+    // MARK: - Scheduled start on activation (v44)
+    //
+    // The banner tap is no longer the only scheduled-start trigger: an app
+    // open / foreground also checks whether a scheduled occurrence is
+    // current, and if so runs the SAME handleScheduleTap path (currency
+    // gate, reconcile, completed-hold, check-first all inherited). The
+    // consumption marker is the one new guard: per tab it records
+    // "yyyy-MM-dd|on" (Toronto date + the occurrence's on-minutes) once
+    // that occurrence has produced its ride, so a ride that was stopped
+    // or completed inside its window is never resurrected by a later
+    // open. The marker is written when a scheduled start creates or
+    // re-tags a ride, when a schedule ride is stopped or completed, and
+    // when one is ended by a schedule override. It is read ONLY here -
+    // the tap path never reads it, so taps behave exactly as before.
+
+    private func schedOccurrence(page: String) -> String {
+        return torontoDayKey(Date()) + "|" + String(ScheduleManager.shared.latestWindow(forTab: page).on)
+    }
+
+    private func markSchedConsumed(page: String) {
+        UserDefaults.standard.set(schedOccurrence(page: page), forKey: "stcecilia_sched_consumed_" + page)
+    }
+
+    private func schedConsumed(page: String) -> Bool {
+        return UserDefaults.standard.string(forKey: "stcecilia_sched_consumed_" + page) == schedOccurrence(page: page)
+    }
+
+    /// Activation trigger: called on cold launch (after restore(), before
+    /// the page loads) and on every foreground. Fires handleScheduleTap
+    /// for a tab only when ALL hold: schedule enabled, weekday rule
+    /// satisfied, now inside [on-15, off], occurrence not consumed, and
+    /// no live ride on the OTHER tab (skip - a mere open must not
+    /// override a live ride; the banner tap keeps that power).
+    func checkScheduleOnActivation(source: String) {
+        let d = UserDefaults.standard
+        guard d.bool(forKey: "stcecilia_sched_enabled") else {
+            nativeLog("SCHED", "activation (\(source)): skip - schedule disabled")
+            return
+        }
+        let now = Date()
+        if d.bool(forKey: "stcecilia_sched_weekdays") {
+            var cal = Calendar(identifier: .gregorian)
+            cal.timeZone = torontoTimeZone
+            let wd = cal.component(.weekday, from: now)
+            if wd == 1 || wd == 7 {
+                nativeLog("SCHED", "activation (\(source)): skip - weekend, weekdays-only")
+                return
+            }
+        }
+        let nowMin = torontoMinutes(now)
+        for tab in ["am", "pm"] {
+            let window = ScheduleManager.shared.latestWindow(forTab: tab)
+            if nowMin < window.on - 15 || nowMin > window.off {
+                nativeLog("SCHED", "activation (\(source)): page=\(tab) outside window [\(window.on - 15),\(window.off)] now=\(nowMin)")
+                continue
+            }
+            if schedConsumed(page: tab) {
+                nativeLog("SCHED", "activation (\(source)): page=\(tab) skip - occurrence consumed")
+                continue
+            }
+            if let r = ride, !r.ended, !r.completed, r.tab != tab {
+                nativeLog("SCHED", "activation (\(source)): page=\(tab) skip - live ride on \(r.tab)")
+                continue
+            }
+            nativeLog("SCHED", "activation (\(source)): page=\(tab) FIRE")
+            _ = handleScheduleTap(tab: tab)
+        }
     }
 
     /// D7: skip the next unreached stop natively. Marks it reached+skipped
@@ -482,6 +557,7 @@ final class LocationTracker: NSObject {
     func stopRide() {
         nativeLog("SYS", "stopRide")
         guard ride != nil else { return }
+        if let r = ride, r.scheduledRide { markSchedConsumed(page: r.tab) }
         startNotificationPending = false
         startNotificationShownAccuracy = nil
         UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [Self.startNotificationID])
@@ -932,6 +1008,7 @@ final class LocationTracker: NSObject {
             r.completedAt = Date()
             r.revision += 1
             RideStore.save(r)
+            if r.scheduledRide { markSchedConsumed(page: r.tab) }
             nativeLog("SNAP", snapLogLine(ride: r, state: "completed"))
         }
         ride = nil
