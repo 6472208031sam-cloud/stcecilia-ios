@@ -16,7 +16,7 @@ targets:
     info:
       path: StCecilia/Info.plist
       properties:
-        CFBundleDisplayName: St Cecilia v44
+        CFBundleDisplayName: St Cecilia v45
         CFBundleShortVersionString: "11.0"
         CFBundleVersion: "5"
         ITSAppUsesNonExemptEncryption: false
@@ -24,9 +24,29 @@ targets:
         NSLocationAlwaysAndWhenInUseUsageDescription: "St Cecilia tracks your ride in the background so stop alerts keep working when the screen is off or the app is minimized."
         UIBackgroundModes: [location, audio, fetch]
         BGTaskSchedulerPermittedIdentifiers: [io.github.stcecilia.refresh]
+        NSSupportsLiveActivities: true
         UILaunchScreen: {}
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+    dependencies:
+      - target: StCeciliaWidgets
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.github.stcecilia
+        SWIFT_VERSION: "5.0"
+  StCeciliaWidgets:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: StCecilia/Widgets
+      - path: StCecilia/Sources/RideActivityAttributes.swift
+    info:
+      path: StCecilia/Widgets/Info.plist
+      properties:
+        CFBundleDisplayName: St Cecilia Widgets
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.stcecilia.widgets
         SWIFT_VERSION: "5.0"
