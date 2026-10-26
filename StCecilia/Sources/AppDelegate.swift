@@ -21,6 +21,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
         // Scheduled-start rescue (v44): if a scheduled occurrence is
         // current, start it natively BEFORE the page loads, so the page
         // adopts the scheduled ride instead of auto-starting a manual one.
+        LocationTracker.shared.adoptLiveActivityOnLaunch()
         LocationTracker.shared.checkScheduleOnActivation(source: "launch")
         window = UIWindow(frame: UIScreen.main.bounds)
         window?.rootViewController = ViewController()

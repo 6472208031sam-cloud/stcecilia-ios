@@ -95,6 +95,15 @@ final class LocationTracker: NSObject {
         }
     }
 
+    /// LiveActivityManager's log route (same pattern as schedLog).
+    func liveLog(_ msg: String) {
+        if Thread.isMainThread {
+            nativeLog("LIVE", msg)
+        } else {
+            DispatchQueue.main.async { [weak self] in self?.nativeLog("LIVE", msg) }
+        }
+    }
+
     /// Set by ViewController: evaluates JS in the page.
     var jsEval: ((String) -> Void)?
     /// Called when a permission-deferred ride auto-starts.
@@ -257,6 +266,7 @@ final class LocationTracker: NSObject {
             subject.endReason = "legacy"
             subject.revision += 1
             EndedStore.save(subject)
+            LiveActivityManager.shared.end(rideId: subject.rideId)
             RideStore.clear()
             teardownInMemory(subject)
             nativeLog("SNAP", snapLogLine(ride: subject, state: "ended"))
@@ -272,6 +282,7 @@ final class LocationTracker: NSObject {
                 subject.revision += 1
                 RideStore.save(subject)
                 if subject.scheduledRide { markSchedConsumed(page: subject.tab) }
+                LiveActivityManager.shared.endCompleted(ride: subject)
                 nativeLog("SNAP", snapLogLine(ride: subject, state: "completed"))
             } else {
                 subject.ending = false
@@ -280,6 +291,7 @@ final class LocationTracker: NSObject {
                 subject.endReason = "ending-finalized"
                 subject.revision += 1
                 EndedStore.save(subject)
+                LiveActivityManager.shared.end(rideId: subject.rideId)
                 RideStore.clear()
                 teardownInMemory(subject)
                 nativeLog("SNAP", snapLogLine(ride: subject, state: "ended"))
@@ -294,6 +306,7 @@ final class LocationTracker: NSObject {
             subject.revision += 1
             RideStore.save(subject)
             if subject.scheduledRide { markSchedConsumed(page: subject.tab) }
+            LiveActivityManager.shared.endCompleted(ride: subject)
             nativeLog("SNAP", snapLogLine(ride: subject, state: "completed"))
             nativeLog("RECON", "classified complete ride=\(id8(subject))")
             return
@@ -315,6 +328,7 @@ final class LocationTracker: NSObject {
                 let rid = id8(subject)
                 let tab = subject.tab
                 RideStore.clear()
+                LiveActivityManager.shared.end(rideId: subject.rideId)
                 teardownInMemory(subject)
                 nativeLog("RECON", "discarded stale ride=\(rid) route=\(tab) reason=\(reason)")
                 return
@@ -397,6 +411,7 @@ final class LocationTracker: NSObject {
             old.endReason = "schedule-override"
             old.revision += 1
             EndedStore.save(old)
+            LiveActivityManager.shared.end(rideId: old.rideId)
             nativeLog("SNAP", snapLogLine(ride: old, state: "ended"))
             nativeLog("SCHED", "schedule override: ended ride=\(id8(old)) route=\(old.tab) reason=schedule-override")
             teardownInMemory(old)
@@ -422,6 +437,7 @@ final class LocationTracker: NSObject {
         if !override { EndedStore.clear() }
         persist()
         beginTracking()
+        LiveActivityManager.shared.start(ride: r)
         nativeLog("SYS", "startRide: started stops=\(ride?.stops.count ?? 0)")
         return "started"
     }
@@ -517,6 +533,23 @@ final class LocationTracker: NSObject {
         }
     }
 
+    /// v45 launch adoption: after restore(), adopt the live ride's Live
+    /// Activity (start hook — keyed by rideId, so it adopts rather than
+    /// duplicates). With no live ride, keep a still-lingering completed
+    /// card (it carries its own 5-minute dismissal) and end the rest.
+    func adoptLiveActivityOnLaunch() {
+        if let r = ride, !r.completed, !r.ended {
+            LiveActivityManager.shared.start(ride: r)
+            return
+        }
+        var keepId: String? = nil
+        if let stored = RideStore.load(), stored.completed, let at = stored.completedAt,
+           Date().timeIntervalSince(at) < 300 {
+            keepId = stored.rideId
+        }
+        LiveActivityManager.shared.sweep(currentRideId: keepId)
+    }
+
     /// D7: skip the next unreached stop natively. Marks it reached+skipped
     /// with NO arrival side-effects (no ntfy, no sound); skipping the last
     /// unreached stop ends the ride as ENDED (reason "skip-final").
@@ -554,8 +587,9 @@ final class LocationTracker: NSObject {
 
     func stopRide() {
         nativeLog("SYS", "stopRide")
-        guard ride != nil else { return }
-        if let r = ride, r.scheduledRide { markSchedConsumed(page: r.tab) }
+        guard let ending = ride else { return }
+        if ending.scheduledRide { markSchedConsumed(page: ending.tab) }
+        LiveActivityManager.shared.end(rideId: ending.rideId)
         startNotificationPending = false
         startNotificationShownAccuracy = nil
         UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [Self.startNotificationID])
@@ -984,6 +1018,7 @@ final class LocationTracker: NSObject {
             r.revision += 1
             RideStore.save(r)
             nativeLog("SNAP", snapLogLine(ride: r, state: r.completed ? "completed" : "active"))
+            LiveActivityManager.shared.sync(ride: r)
         }
     }
 
@@ -1007,6 +1042,7 @@ final class LocationTracker: NSObject {
             r.revision += 1
             RideStore.save(r)
             if r.scheduledRide { markSchedConsumed(page: r.tab) }
+            LiveActivityManager.shared.endCompleted(ride: r)
             nativeLog("SNAP", snapLogLine(ride: r, state: "completed"))
         }
         ride = nil
