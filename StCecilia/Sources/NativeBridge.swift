@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 
 /// Exposes `window.NativeBridge` to the web page with the SAME interface as
 /// the Android app: startRide(configJson) -> "started"/"permission_needed"/"error",
@@ -54,7 +55,11 @@ final class NativeBridge {
           var r = call('getNativeLogs');
           return (typeof r === 'string') ? r : '';
         },
-        clearNativeLogs: function() { call('clearNativeLogs'); }
+        clearNativeLogs: function() { call('clearNativeLogs'); },
+        downloadLogs: function(filename, text) {
+          var r = call('downloadLogs', filename + '\\n' + text);
+          return (typeof r === 'string') ? r : '';
+        }
       };
     })();
     """
@@ -93,9 +98,40 @@ final class NativeBridge {
         case "clearNativeLogs":
             LocationTracker.shared.clearNativeLogs()
             return jsonResponse(nil)
+        case "downloadLogs":
+            return jsonResponse(Self.presentLogShare(arg))
         default:
             return jsonResponse(nil)
         }
+    }
+
+    /// v47: writes the page-assembled log export to a temp file and
+    /// presents the share sheet (Save to Files / Mail / AirDrop). The
+    /// shim packs "filename\ntext" into the single bridge argument.
+    /// Returns the status string the page toasts.
+    private static func presentLogShare(_ arg: String?) -> String {
+        guard let arg = arg, let nl = arg.firstIndex(of: "\n") else { return "Download failed." }
+        let filename = String(arg[arg.startIndex..<nl])
+        let text = String(arg[arg.index(after: nl)...])
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(filename)
+        do { try text.write(to: url, atomically: true, encoding: .utf8) }
+        catch { return "Download failed." }
+        DispatchQueue.main.async {
+            guard let vc = topViewController() else { return }
+            let avc = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+            avc.popoverPresentationController?.sourceView = vc.view
+            vc.present(avc, animated: true)
+        }
+        return "Share sheet opened."
+    }
+
+    private static func topViewController() -> UIViewController? {
+        let scene = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first { $0.activationState == .foregroundActive }
+        var vc = scene?.windows.first { $0.isKeyWindow }?.rootViewController
+        while let presented = vc?.presentedViewController { vc = presented }
+        return vc
     }
 
     private func jsonResponse(_ value: Any?) -> String {

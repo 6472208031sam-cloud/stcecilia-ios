@@ -69,23 +69,61 @@ final class LocationTracker: NSObject {
     private var lastGpsLogAt: Date = .distantPast
     private static let logTimeFormatter: DateFormatter = {
         let f = DateFormatter()
-        f.dateFormat = "HH:mm:ss.SSS"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
         return f
     }()
 
     private func nativeLog(_ cat: String, _ msg: String) {
+        restoreLogsIfNeeded()
         let ts = Self.logTimeFormatter.string(from: Date())
         nativeLogs.append("[\(ts)] [\(cat)] \(msg)")
-        if nativeLogs.count > 200 { nativeLogs.removeFirst(nativeLogs.count - 200) }
+        if nativeLogs.count > 1000 { nativeLogs.removeFirst(nativeLogs.count - 1000) }
+        logLinesSinceFlush += 1
+        flushLogsIfDue()
     }
 
     /// Joined log text for the WebView via NativeBridge.getNativeLogs().
     func nativeLogsText() -> String {
+        restoreLogsIfNeeded()
         return nativeLogs.joined(separator: "\n")
     }
 
     func clearNativeLogs() {
+        restoreLogsIfNeeded()
         nativeLogs.removeAll()
+        if let url = Self.logFileURL { try? FileManager.default.removeItem(at: url) }
+    }
+
+    // MARK: - v47 log persistence (app-private file; survives process death)
+
+    private var logsRestored = false
+    private var logLinesSinceFlush = 0
+    private var lastLogFlushAt: Date = .distantPast
+
+    private static var logFileURL: URL? {
+        let fm = FileManager.default
+        guard let dir = try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true) else { return nil }
+        return dir.appendingPathComponent("nativelogs.txt")
+    }
+
+    private func restoreLogsIfNeeded() {
+        if logsRestored { return }
+        logsRestored = true
+        guard let url = Self.logFileURL,
+              let text = try? String(contentsOf: url, encoding: .utf8) else { return }
+        let lines = text.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
+        // File lines predate anything this process has logged.
+        nativeLogs = Array(lines.suffix(1000)) + nativeLogs
+        if nativeLogs.count > 1000 { nativeLogs.removeFirst(nativeLogs.count - 1000) }
+    }
+
+    private func flushLogsIfDue(force: Bool = false) {
+        if !force && logLinesSinceFlush < 50 && Date().timeIntervalSince(lastLogFlushAt) < 5 { return }
+        logLinesSinceFlush = 0
+        lastLogFlushAt = Date()
+        guard let url = Self.logFileURL else { return }
+        try? nativeLogs.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
     }
 
     /// ScheduleManager has no log buffer of its own; route its lines here
@@ -641,6 +679,7 @@ final class LocationTracker: NSObject {
         RideStore.clear()
         EndedStore.clear()
         nativeLog("SNAP", snapLogLine(ride: nil, state: "none"))
+        flushLogsIfDue(force: true)
         jsEval?("if (typeof nativeNoRide === 'function') { try { nativeNoRide(); } catch(e){} }")
     }
 
@@ -1090,6 +1129,7 @@ final class LocationTracker: NSObject {
         nearCount = 0
         nearTargetIdx = -1
         manager.stopUpdatingLocation()
+        flushLogsIfDue(force: true)
         jsEval?("if (typeof nativeFinished === 'function') { try { nativeFinished(); } catch(e){} }")
     }
 
