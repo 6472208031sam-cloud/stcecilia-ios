@@ -82,6 +82,12 @@ private final class LiveActivityEngine {
 
     private func log(_ msg: String) { LocationTracker.shared.liveLog(msg) }
 
+    /// v46: the card's freshness deadline — 10 minutes past every
+    /// send (Domi's pick). A live ride renews it at every stop event;
+    /// if updates stop (force-quit, app death), the system dims the
+    /// card instead of letting it pose as live.
+    private func freshStaleDate() -> Date { Date().addingTimeInterval(600) }
+
     private func makeState(_ ride: RideState) -> RideActivityAttributes.ContentState {
         let snap = LiveActivityManager.snapshot(for: ride)
         return RideActivityAttributes.ContentState(
@@ -102,7 +108,7 @@ private final class LiveActivityEngine {
         let state = makeState(ride)
         if let existing = activity(for: ride.rideId) {
             lastSent[ride.rideId] = state
-            Task { await existing.update(ActivityContent(state: state, staleDate: nil)) }
+            Task { await existing.update(ActivityContent(state: state, staleDate: freshStaleDate())) }
             log("adopt ride=\(String(ride.rideId.prefix(8))) route=\(ride.tab)")
             return
         }
@@ -119,7 +125,7 @@ private final class LiveActivityEngine {
             stopIds: ride.stops.enumerated().map { LiveActivityManager.chipId(for: $0.element, index: $0.offset, route: ride.tab) },
             rideId: ride.rideId)
         do {
-            let act = try Activity.request(attributes: attrs, content: ActivityContent(state: state, staleDate: nil), pushType: nil)
+            let act = try Activity.request(attributes: attrs, content: ActivityContent(state: state, staleDate: freshStaleDate()), pushType: nil)
             lastSent[ride.rideId] = state
             log("start ride=\(String(act.attributes.rideId.prefix(8))) route=\(attrs.route) total=\(attrs.total)")
         } catch {
@@ -132,7 +138,7 @@ private final class LiveActivityEngine {
         let state = makeState(ride)
         if lastSent[ride.rideId] == state { return }
         lastSent[ride.rideId] = state
-        Task { await act.update(ActivityContent(state: state, staleDate: nil)) }
+        Task { await act.update(ActivityContent(state: state, staleDate: freshStaleDate())) }
         log("update ride=\(String(ride.rideId.prefix(8))) reached=\(state.reachedCount)/\(ride.stops.count)")
     }
 
@@ -145,7 +151,7 @@ private final class LiveActivityEngine {
         lastSent.removeValue(forKey: rideId)
         if let ride = completed {
             let state = makeState(ride)
-            Task { await act.end(ActivityContent(state: state, staleDate: nil), dismissalPolicy: .after(Date().addingTimeInterval(300))) }
+            Task { await act.end(ActivityContent(state: state, staleDate: freshStaleDate()), dismissalPolicy: .after(Date().addingTimeInterval(300))) }
             log("end completed ride=\(String(rideId.prefix(8))) - dismissal +5 min")
         } else {
             Task { await act.end(nil, dismissalPolicy: .immediate) }
