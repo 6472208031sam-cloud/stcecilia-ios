@@ -309,7 +309,7 @@ final class LocationTracker: NSObject {
         let body: [String: Any] = [
             "tag": r.deviceId,
             "label": r.deviceLabel,
-            "route": r.page,
+            "route": r.tab,
             "lat": lat,
             "lng": lng,
             "acc": Int(accuracy.rounded()),
@@ -365,7 +365,7 @@ final class LocationTracker: NSObject {
         let body: [String: Any] = [
             "tag": r.deviceId,
             "label": r.deviceLabel,
-            "route": r.page,
+            "route": r.tab,
             "lat": posGoodLat,
             "lng": posGoodLng,
             "acc": Int(posGoodAcc.rounded()),
