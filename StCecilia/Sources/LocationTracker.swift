@@ -26,6 +26,14 @@ final class LocationTracker: NSObject {
     private var posLastLng = 0.0
     private var posLastSend = Date.distantPast
     private var posSentThisRide = false
+    // v51: last accuracy-passing fix (the heartbeat timer's payload)
+    // + the timer itself, keyed to the ride like the cadence state.
+    private var posGoodLat = 0.0
+    private var posGoodLng = 0.0
+    private var posGoodAcc = 0.0
+    private var posGoodTime = Date.distantPast
+    private var posTimer: DispatchSourceTimer?
+    private var posTimerRideId = ""
     /// v46: stamp (Toronto day + minute) of the last off-stop tick
     /// evaluation, so the location tick checks at most once a minute.
     private var lastOffCheckStamp = ""
@@ -279,10 +287,17 @@ final class LocationTracker: NSObject {
             posRideId = r.rideId
             posSentThisRide = false
             posLastSend = Date.distantPast
+            posGoodTime = Date.distantPast
+            armPosTimer(rideId: r.rideId)
         }
         guard r.followerOn, !r.fbBase.isEmpty, !r.fbPath.isEmpty, !r.deviceId.isEmpty else { return }
         guard accuracy <= 100 else { return }
         let now = Date()
+        // v51: cache every acceptable fix for the heartbeat timer.
+        posGoodLat = lat
+        posGoodLng = lng
+        posGoodAcc = accuracy
+        posGoodTime = now
         let dist = posSentThisRide ? haversine(lat1: posLastLat, lon1: posLastLng, lat2: lat, lon2: lng) : 0
         let dt = posSentThisRide ? now.timeIntervalSince(posLastSend) : Double.infinity
         let due = !posSentThisRide || dist >= 100 || (dist >= 25 && dt >= 5) || dt >= 30
@@ -308,9 +323,66 @@ final class LocationTracker: NSObject {
         }
     }
 
+    // v51: 30 s heartbeat timer. The cadence heartbeat used to be
+    // evaluated only per delivered fix; a still phone delivers none
+    // (5 m distance filter), so the feed starved and the follower
+    // dot went stale whenever the bus sat still. The timer re-sends
+    // the last good fix with a fresh timestamp; it re-sends only a
+    // fix at most 5 minutes old — past that the dot goes honestly
+    // stale. Stopped by markPositionInactive, which every ride-end
+    // path already calls.
+    private func armPosTimer(rideId: String) {
+        if posTimerRideId == rideId, posTimer != nil { return }
+        stopPosTimer()
+        posTimerRideId = rideId
+        let t = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "pos.heartbeat"))
+        t.schedule(deadline: .now() + 30, repeating: 30)
+        t.setEventHandler { [weak self] in
+            DispatchQueue.main.async { self?.maybeTimerSend() }
+        }
+        t.resume()
+        posTimer = t
+    }
+
+    private func stopPosTimer() {
+        posTimer?.cancel()
+        posTimer = nil
+        posTimerRideId = ""
+    }
+
+    private func maybeTimerSend() {
+        guard let r = ride, !r.completed, !r.ended, r.rideId == posTimerRideId else { stopPosTimer(); return }
+        guard r.followerOn, !r.fbBase.isEmpty, !r.fbPath.isEmpty, !r.deviceId.isEmpty else { return }
+        guard posGoodTime != Date.distantPast else { return }
+        let now = Date()
+        let sinceSend = now.timeIntervalSince(posLastSend)
+        guard sinceSend >= 30 else { return }
+        guard now.timeIntervalSince(posGoodTime) <= 300 else { return }
+        posLastLat = posGoodLat
+        posLastLng = posGoodLng
+        posLastSend = now
+        posSentThisRide = true
+        let body: [String: Any] = [
+            "tag": r.deviceId,
+            "label": r.deviceLabel,
+            "route": r.page,
+            "lat": posGoodLat,
+            "lng": posGoodLng,
+            "acc": Int(posGoodAcc.rounded()),
+            "ts": Int(now.timeIntervalSince1970 * 1000),
+            "active": true,
+        ]
+        FirebaseClient.put(base: r.fbBase, path: r.fbPath, tag: r.deviceId, body: body) { [weak self] code in
+            DispatchQueue.main.async {
+                self?.nativeLog("POS", "put (\(code ?? -1)) dist=0m dt=\(Int(sinceSend))s")
+            }
+        }
+    }
+
     /// Ride end: mark this device's record inactive so the followers
     /// retire the dot. Idempotent; gated on config presence only.
     private func markPositionInactive(ride r: RideState) {
+        stopPosTimer()
         guard !r.fbBase.isEmpty, !r.fbPath.isEmpty, !r.deviceId.isEmpty else { return }
         posSentThisRide = false
         let body: [String: Any] = [
