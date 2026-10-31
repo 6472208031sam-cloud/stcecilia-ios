@@ -674,6 +674,9 @@ final class LocationTracker: NSObject {
             r.revision += 1
             EndedStore.save(r)
             RideStore.clear()
+            // End the Live Activity with the ride (immediate dismissal):
+            // this path finalizes the ride itself, so nothing else ends it.
+            LiveActivityManager.shared.end(rideId: r.rideId)
             ride = nil
             nearCounts = []
             manager.stopUpdatingLocation()
@@ -1445,6 +1448,10 @@ final class LocationTracker: NSObject {
                                 cur.revision += 1
                                 EndedStore.save(cur)
                                 RideStore.clear()
+                                // End the Live Activity with the ride
+                                // (immediate dismissal): this finalize
+                                // retires the ride, so nothing else ends it.
+                                LiveActivityManager.shared.end(rideId: cur.rideId)
                                 self.ride = nil
                                 self.nearCounts = []
                                 self.manager.stopUpdatingLocation()
