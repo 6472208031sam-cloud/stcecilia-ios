@@ -50,6 +50,11 @@ final class RideState {
     var page = "am"
     var tab = "am"
     var topic = ""
+    // Live Tracker (v50): Firebase position-writer config, riding the
+    // page config alongside the topic. Values live in the driver
+    // page's config only; never logged (the path is a secret).
+    var fbBase = ""
+    var fbPath = ""
     var deviceId = ""
     var deviceLabel = ""
     var myStopAm = ""
@@ -98,6 +103,8 @@ final class RideState {
         page = json["page"] as? String ?? "am"
         tab = json["tab"] as? String ?? "am"
         topic = json["topic"] as? String ?? ""
+        fbBase = json["fbBase"] as? String ?? ""
+        fbPath = json["fbPath"] as? String ?? ""
         deviceId = json["deviceId"] as? String ?? ""
         deviceLabel = json["deviceLabel"] as? String ?? ""
         if let ms = json["myStop"] as? [String: Any] {
@@ -157,6 +164,8 @@ final class RideState {
             "page": page,
             "tab": tab,
             "topic": topic,
+            "fbBase": fbBase,
+            "fbPath": fbPath,
             "deviceId": deviceId,
             "deviceLabel": deviceLabel,
             "myStop": ["am": myStopAm, "pm": myStopPm],
