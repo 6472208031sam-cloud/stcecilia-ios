@@ -26,6 +26,11 @@ final class LocationTracker: NSObject {
     private var posLastLng = 0.0
     private var posLastSend = Date.distantPast
     private var posSentThisRide = false
+    // v53: terminal guard — set by markPositionInactive; once a ride
+    // has ended, no active send may follow its inactive mark (the
+    // final fix's own funnel pass included). Cleared in the
+    // ride-id reset block below when a new ride appears.
+    private var posRideEnded = false
     // v51: last accuracy-passing fix (the heartbeat timer's payload)
     // + the timer itself, keyed to the ride like the cadence state.
     private var posGoodLat = 0.0
@@ -286,10 +291,13 @@ final class LocationTracker: NSObject {
         if r.rideId != posRideId {
             posRideId = r.rideId
             posSentThisRide = false
+            posRideEnded = false
             posLastSend = Date.distantPast
             posGoodTime = Date.distantPast
             armPosTimer(rideId: r.rideId)
         }
+        // v53: a marked ride sends nothing more — not even this fix.
+        if posRideEnded { return }
         guard r.followerOn, !r.fbBase.isEmpty, !r.fbPath.isEmpty, !r.deviceId.isEmpty else { return }
         guard accuracy <= 100 else { return }
         let now = Date()
@@ -382,6 +390,7 @@ final class LocationTracker: NSObject {
     /// Ride end: mark this device's record inactive so the followers
     /// retire the dot. Idempotent; gated on config presence only.
     private func markPositionInactive(ride r: RideState) {
+        posRideEnded = true
         stopPosTimer()
         guard !r.fbBase.isEmpty, !r.fbPath.isEmpty, !r.deviceId.isEmpty else { return }
         posSentThisRide = false
