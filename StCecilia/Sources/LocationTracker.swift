@@ -1355,6 +1355,7 @@ final class LocationTracker: NSObject {
             if best > idx && bestDist <= r.snapDistance {
                 snappedThisFix = true
                 nativeLog("STOP", "Snap forward \(idx)->\(best) (\(r.stops[best].label)) dist=\(Int(bestDist))m")
+                sendStartingNotice(best: best, ride: r)
                 for i in idx..<best {
                     r.stops[i].reached = true
                     r.stops[i].skipped = true
@@ -1464,6 +1465,23 @@ final class LocationTracker: NSObject {
 
     /// The ⏭ skipped notice, mirroring the arrival send's gating and
     /// [NTFY] verdict logging. Issued before the arrival's own send.
+    // v54: ride-start snap notice - sent when the snap below skips
+    // >=1 stop, so followers can move their next-stop glow before
+    // the first real event (display-only hint on the follower).
+    private func sendStartingNotice(best: Int, ride r: RideState) {
+        let devTag = r.deviceId.isEmpty ? "" : " [" + r.deviceId + "]" + (r.deviceLabel.isEmpty ? "" : " (" + r.deviceLabel + ")")
+        let msg = "📱\(devTag) starting at \(r.stops[best].label)."
+        if r.followerOn && !r.topic.isEmpty {
+            nativeLog("NTFY", "Sending starting: \(msg)")
+            NtfyClient.post(topic: r.topic, message: msg) { [weak self] in
+                DispatchQueue.main.async { self?.nativeLog("NTFY", "Sent: \(msg)") }
+            }
+        } else {
+            nativeLog("NTFY", "Suppressed starting (follower alerts off): \(msg)")
+        }
+    }
+
+
     private func sendSkippedNotice(cur: RideStop, ride r: RideState) {
         let devTag = r.deviceId.isEmpty ? "" : " [" + r.deviceId + "]" + (r.deviceLabel.isEmpty ? "" : " (" + r.deviceLabel + ")")
         let msg = "⏭\(devTag) skipped \(cur.label)."
