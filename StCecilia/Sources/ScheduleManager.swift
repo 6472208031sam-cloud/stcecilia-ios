@@ -36,6 +36,8 @@ final class ScheduleManager {
         d.set(config.schedWeekdaysOnly, forKey: "stcecilia_sched_weekdays")
         LocationTracker.shared.schedLog("apply persisted off1=\(config.schedOff1) off2=\(config.schedOff2)")
         schedule()
+        // v55: the schedule toggle also arms/disarms SLC auto-start.
+        LocationTracker.shared.updateSlcArming(enabled: config.schedEnabled)
     }
 
     /// The latest schedule window for a tab (Toronto minutes since

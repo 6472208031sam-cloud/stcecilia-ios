@@ -18,15 +18,36 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
         // Resume a persisted ride if the app was terminated mid-ride
         // (mirrors Android's START_STICKY service restart).
         LocationTracker.shared.restore()
-        // Scheduled-start rescue (v44): if a scheduled occurrence is
-        // current, start it natively BEFORE the page loads, so the page
-        // adopts the scheduled ride instead of auto-starting a manual one.
-        LocationTracker.shared.adoptLiveActivityOnLaunch()
-        LocationTracker.shared.checkScheduleOnActivation(source: "launch")
+        // v55: re-assert SLC arming from the stored schedule toggle.
+        LocationTracker.shared.assertSlcArming()
+        if launchOptions?[.location] != nil {
+            LocationTracker.shared.schedLog("launched by a location event")
+        }
+        // v55 (F1 + amendment): a launch in the background state (an
+        // SLC or refresh relaunch of a terminated app) must not build
+        // the window \u2014 the page would auto-start a manual ride
+        // the schedule check never gated \u2014 and its activation
+        // check logs its verdict but never fires or consumes. The
+        // window is built at the first real foreground instead.
+        if application.applicationState == .background {
+            LocationTracker.shared.launchDeferred = true
+            LocationTracker.shared.checkScheduleOnActivation(source: "launch")
+        } else {
+            // Scheduled-start rescue (v44): if a scheduled occurrence is
+            // current, start it natively BEFORE the page loads, so the page
+            // adopts the scheduled ride instead of auto-starting a manual one.
+            LocationTracker.shared.adoptLiveActivityOnLaunch()
+            LocationTracker.shared.checkScheduleOnActivation(source: "launch")
+            buildWindow()
+        }
+        return true
+    }
+
+    private func buildWindow() {
+        guard window == nil else { return }
         window = UIWindow(frame: UIScreen.main.bounds)
         window?.rootViewController = ViewController()
         window?.makeKeyAndVisible()
-        return true
     }
 
     // MARK: - UNUserNotificationCenterDelegate
@@ -105,6 +126,13 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
         // Warm reopen inside a schedule window rescues a missed banner:
         // same activation check as launch (logs a verdict either way).
         LocationTracker.shared.checkScheduleOnActivation(source: "foreground")
+        // v55 (F2): adopt the Live Activity of a live ride (e.g. an
+        // SLC-started one) \u2014 start hook only, never the sweep.
+        LocationTracker.shared.adoptLiveRideActivityOnForeground()
+        // v55 (F1): a background launch deferred the window; build it
+        // now, after the native checks, so the page adopts native
+        // state instead of auto-starting over it.
+        buildWindow()
     }
 
     func applicationDidEnterBackground(_ application: UIApplication) {

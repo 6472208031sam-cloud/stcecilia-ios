@@ -43,6 +43,23 @@ final class LocationTracker: NSObject {
     /// evaluation, so the location tick checks at most once a minute.
     private var lastOffCheckStamp = ""
     private var pendingConfig: String?
+    // v55: SLC auto-start (PM only). Own location manager + delegate,
+    // so the ride-critical location path stays byte-untouched.
+    private let slcManager = CLLocationManager()
+    private var slcDelegate: SlcLocationDelegate?
+    private var slcArmed = false
+    private var slcEvaluating = false
+    private var slcCollecting = false
+    private var slcBestFix: CLLocation?
+    private var slcCollectDeadline: DispatchWorkItem?
+    /// v55: one-shot flag — set by the evaluator immediately before
+    /// it calls handleScheduleTap; consumed (and cleared) in
+    /// createFreshRide, which stamps the new ride's slcStarted.
+    private var pendingSlcStart = false
+    /// v55 amendment: true when this process was launched in the
+    /// background state — the launch activation check then logs its
+    /// verdict but never fires and never consumes an occurrence.
+    var launchDeferred = false
     // Phase 4 ENABLE: one-stop restore recovery evaluation.
     // Armed ONLY in restore() when a persisted ride resumes after
     // process death; evaluated once (immediately for the final-stop /
@@ -226,6 +243,19 @@ final class LocationTracker: NSObject {
         if #available(iOS 11.0, *) {
             manager.showsBackgroundLocationIndicator = true
         }
+        // v55: the SLC manager — same background-location guard as the
+        // ride manager (continuous fixes during the 20 s fence window
+        // are background updates too).
+        let slcDel = SlcLocationDelegate()
+        slcDel.onLocations = { [weak self] locs in self?.slcLocations(locs) }
+        slcDel.onFailure = { [weak self] in self?.slcFixFailed() }
+        slcDelegate = slcDel
+        slcManager.delegate = slcDel
+        slcManager.desiredAccuracy = kCLLocationAccuracyHundredMeters
+        slcManager.pausesLocationUpdatesAutomatically = false
+        if bgModes.contains("location") {
+            slcManager.allowsBackgroundLocationUpdates = true
+        }
     }
 
     // MARK: - Toronto time helpers (Phase 2)
@@ -360,6 +390,9 @@ final class LocationTracker: NSObject {
 
     private func maybeTimerSend() {
         guard let r = ride, !r.completed, !r.ended, r.rideId == posTimerRideId else { stopPosTimer(); return }
+        // v55: SLC abandon — evaluated ABOVE the follower/config
+        // guard, so a follower-off phone still abandons its ride.
+        if checkSlcAbandon() { return }
         guard r.followerOn, !r.fbBase.isEmpty, !r.fbPath.isEmpty, !r.deviceId.isEmpty else { return }
         guard posGoodTime != Date.distantPast else { return }
         let now = Date()
@@ -651,6 +684,10 @@ final class LocationTracker: NSObject {
         r.rideId = UUID().uuidString
         r.startedAt = Int(Date().timeIntervalSince1970 * 1000)
         r.startSource = scheduled ? "schedule" : "manual"
+        // v55: the SLC evaluator's one-shot flag stamps its ride;
+        // every other fresh start consumes (clears) it unstamped.
+        r.slcStarted = pendingSlcStart
+        pendingSlcStart = false
         r.routeFingerprint = r.computeFingerprint()
         r.scheduledRide = scheduled
         if !override { EndedStore.clear() }
@@ -783,6 +820,15 @@ final class LocationTracker: NSObject {
             }
             if let r = ride, !r.ended, !r.completed, r.tab != tab {
                 nativeLog("SCHED", "activation (\(source)): page=\(tab) skip - live ride on \(r.tab)")
+                continue
+            }
+            if source == "launch", launchDeferred {
+                // v55 amendment: a background-state launch (an SLC or
+                // refresh relaunch of a terminated app) must not fire
+                // and must not consume — from a background launch a
+                // ride can start only via the SLC fence evaluator or
+                // the first real foreground's own activation check.
+                nativeLog("SCHED", "activation (launch): page=\(tab) would FIRE - deferred (background launch)")
                 continue
             }
             nativeLog("SCHED", "activation (\(source)): page=\(tab) FIRE")
@@ -1239,6 +1285,7 @@ final class LocationTracker: NSObject {
             cfg.rideId = r.rideId
             cfg.startedAt = r.startedAt
             cfg.startSource = r.startSource
+            cfg.slcStarted = r.slcStarted
             cfg.routeFingerprint = r.routeFingerprint
             cfg.revision = r.revision
             // Same ride continuing: its recovery credit carries over.
@@ -1252,6 +1299,7 @@ final class LocationTracker: NSObject {
             cfg.rideId = ""
             cfg.startedAt = 0
             cfg.startSource = ""
+            cfg.slcStarted = false
             cfg.routeFingerprint = ""
             cfg.revision = 0
             // No merge: recovery credit must not leak in from the
@@ -1756,6 +1804,231 @@ final class LocationTracker: NSObject {
         out += "\""
         return out
     }
+
+    // MARK: - v55 SLC auto-start
+
+    /// Arm/disarm significant-location-change monitoring. Callers:
+    /// ScheduleManager.apply (the config push) passes the schedule
+    /// toggle; didFinishLaunching re-asserts from the stored toggle.
+    func updateSlcArming(enabled: Bool) {
+        if enabled {
+            guard CLLocationManager.significantLocationChangeMonitoringAvailable() else {
+                nativeLog("SLC", "SLC monitoring not available on this device")
+                return
+            }
+            slcManager.startMonitoringSignificantLocationChanges()
+            if !slcArmed { nativeLog("SLC", "armed (schedule toggle on)") }
+            slcArmed = true
+        } else {
+            if slcArmed { nativeLog("SLC", "disarmed (schedule toggle off)") }
+            slcArmed = false
+            slcCollectCancel()
+            slcManager.stopMonitoringSignificantLocationChanges()
+        }
+    }
+
+    func assertSlcArming() {
+        updateSlcArming(enabled: UserDefaults.standard.bool(forKey: "stcecilia_sched_enabled"))
+    }
+
+    private func slcLocations(_ locations: [CLLocation]) {
+        if slcCollecting {
+            for loc in locations {
+                if loc.horizontalAccuracy >= 0,
+                   slcBestFix == nil || loc.horizontalAccuracy < slcBestFix!.horizontalAccuracy {
+                    slcBestFix = loc
+                }
+            }
+            if let b = slcBestFix, b.horizontalAccuracy <= 50 { slcFinishCollect() }
+            return
+        }
+        slcWake()
+    }
+
+    private func slcFixFailed() {
+        if slcCollecting { slcFinishCollect() }
+    }
+
+    /// An SLC event arrived (terminated-app relaunch or suspended-app
+    /// wake). Gates first — cheap checks before spending the 20 s fix
+    /// window — then a fresh fix, then the pill fence. PM only.
+    private func slcWake() {
+        guard slcArmed else { return }
+        guard !slcEvaluating else { return }
+        if let r = ride, !r.ended, !r.completed {
+            nativeLog("SLC", "wake ignored - live ride \(String(r.rideId.prefix(8)))")
+            return
+        }
+        guard slcManager.authorizationStatus == .authorizedAlways else {
+            nativeLog("SLC", "wake ignored - location auth not Always")
+            return
+        }
+        let d = UserDefaults.standard
+        guard d.bool(forKey: "stcecilia_sched_enabled") else {
+            nativeLog("SLC", "wake ignored - schedule disabled")
+            return
+        }
+        if d.bool(forKey: "stcecilia_sched_weekdays") {
+            let wd = torontoCalendar.component(.weekday, from: Date())
+            if wd == 1 || wd == 7 {
+                nativeLog("SLC", "wake ignored - weekend, weekdays-only")
+                return
+            }
+        }
+        let window = ScheduleManager.shared.latestWindow(forTab: "pm")
+        let nowMin = torontoMinutes(Date())
+        guard nowMin >= window.on - 5, nowMin <= window.off else {
+            nativeLog("SLC", "wake ignored - outside PM window [\(window.on - 5),\(window.off)] now=\(nowMin)")
+            return
+        }
+        if schedConsumed(page: "pm") {
+            nativeLog("SLC", "wake ignored - PM occurrence consumed")
+            return
+        }
+        nativeLog("SLC", "wake - evaluating (PM window [\(window.on - 5),\(window.off)])")
+        slcEvaluating = true
+        slcCollecting = true
+        slcBestFix = nil
+        slcManager.desiredAccuracy = kCLLocationAccuracyBest
+        slcManager.startUpdatingLocation()
+        let deadline = DispatchWorkItem { [weak self] in self?.slcFinishCollect() }
+        slcCollectDeadline = deadline
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20, execute: deadline)
+    }
+
+    private func slcCollectCancel() {
+        slcCollectDeadline?.cancel()
+        slcCollectDeadline = nil
+        if slcCollecting {
+            slcCollecting = false
+            slcManager.stopUpdatingLocation()
+            slcManager.desiredAccuracy = kCLLocationAccuracyHundredMeters
+        }
+        slcEvaluating = false
+    }
+
+    private func slcFinishCollect() {
+        guard slcCollecting else { return }
+        slcCollectCancel()
+        guard let fix = slcBestFix else {
+            nativeLog("SLC", "fence undecided - no fix in 20s")
+            return
+        }
+        let acc = fix.horizontalAccuracy
+        guard acc <= 250 else {
+            nativeLog("SLC", "fence undecided - poor fix acc=\(Int(acc))m")
+            return
+        }
+        guard let cfg = ScheduleManager.shared.configJSON(forTab: "pm"),
+              let data = cfg.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            nativeLog("SLC", "no stored PM config - cannot judge fence")
+            return
+        }
+        let stops = RideState(json: obj).stops
+        guard !stops.isEmpty else {
+            nativeLog("SLC", "no PM stops in config - cannot judge fence")
+            return
+        }
+        let dist = slcPillDistance(fix: fix, stops: stops)
+        if dist <= 500 {
+            nativeLog("SLC", "fence PASS dist=\(Int(dist))m acc=\(Int(acc))m - starting PM ride")
+            pendingSlcStart = true
+            _ = handleScheduleTap(tab: "pm")
+            pendingSlcStart = false
+        } else {
+            nativeLog("SLC", "fence REJECT dist=\(Int(dist))m acc=\(Int(acc))m (>500m from route start line)")
+        }
+    }
+
+    /// Distance in metres from the fix to the pill's centre line:
+    /// the polyline through the PM stops in order, grown stop-by-stop
+    /// until it reaches at least 1500 m. Round caps fall out of the
+    /// point-to-segment distance at the line's ends; a single-stop
+    /// config degrades to the distance to that stop.
+    private func slcPillDistance(fix: CLLocation, stops: [RideStop]) -> Double {
+        let lat0 = fix.coordinate.latitude
+        let lng0 = fix.coordinate.longitude
+        let mpdLng = 111320.0 * cos(lat0 * .pi / 180.0)
+        let mpdLat = 110540.0
+        func xy(_ lat: Double, _ lng: Double) -> (Double, Double) {
+            ((lng - lng0) * mpdLng, (lat0 - lat) * mpdLat)
+        }
+        var pts: [(Double, Double)] = []
+        var cum = 0.0
+        for (i, s) in stops.enumerated() {
+            pts.append(xy(s.lat, s.lng))
+            if i > 0 {
+                let a = stops[i - 1]
+                cum += haversine(lat1: a.lat, lon1: a.lng, lat2: s.lat, lon2: s.lng)
+                if cum >= 1500 { break }
+            }
+        }
+        if pts.count == 1 {
+            let p = pts[0]
+            return hypot(p.0, p.1)
+        }
+        var best = Double.greatestFiniteMagnitude
+        for i in 1..<pts.count {
+            let a = pts[i - 1], b = pts[i]
+            let dx = b.0 - a.0, dy = b.1 - a.1
+            let l2 = dx * dx + dy * dy
+            var t = 0.0
+            if l2 > 0 { t = max(0, min(1, -(a.0 * dx + a.1 * dy) / l2)) }
+            best = min(best, hypot(a.0 + t * dx, a.1 + t * dy))
+        }
+        return best
+    }
+
+    /// v55: end an SLC-started ride that reached no stop within
+    /// 15 minutes of its start. Ends as ENDED (reason "slc-abandon"),
+    /// mirroring the skip-final ending; the occurrence was already
+    /// consumed at start, so nothing can resurrect the ride.
+    @discardableResult
+    private func checkSlcAbandon() -> Bool {
+        guard let r = ride, r.slcStarted, !r.completed, !r.ended else { return false }
+        guard !r.stops.contains(where: { $0.reached }) else { return false }
+        let nowMs = Int(Date().timeIntervalSince1970 * 1000)
+        guard nowMs - r.startedAt >= 900_000 else { return false }
+        nativeLog("SLC", "abandon ride=\(String(r.rideId.prefix(8))) - no stop reached in 15 min")
+        postAbandonNotification()
+        r.ended = true
+        r.endedAt = nowMs
+        r.endReason = "slc-abandon"
+        r.revision += 1
+        EndedStore.save(r)
+        RideStore.clear()
+        teardownLiveRide()
+        nativeLog("SNAP", snapLogLine(ride: r, state: "ended"))
+        jsEval?("if (typeof nativeNoRide === 'function') { try { nativeNoRide(); } catch(e){} }")
+        return true
+    }
+
+    /// v55: tell the user when the abandon check ends an SLC-started
+    /// ride. Mirrors postOffStopNotification; own identifier prefix.
+    private func postAbandonNotification() {
+        let center = UNUserNotificationCenter.current()
+        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        let content = UNMutableNotificationContent()
+        content.title = "St Cecilia"
+        content.body = "Ride ended \u2014 no stops reached."
+        content.sound = .default
+        let req = UNNotificationRequest(
+            identifier: "slcabandon.\(Int(Date().timeIntervalSince1970))",
+            content: content, trigger: nil)
+        center.add(req)
+    }
+
+    /// v55 (F2): at a real foreground, adopt the Live Activity of a
+    /// live ride (e.g. one the SLC evaluator started in the
+    /// background, where the start attempt cannot succeed). Start
+    /// hook ONLY \u2014 unlike adoptLiveActivityOnLaunch it never
+    /// sweeps, so a completed card's linger is never cut here.
+    func adoptLiveRideActivityOnForeground() {
+        if let r = ride, !r.completed, !r.ended {
+            LiveActivityManager.shared.start(ride: r)
+        }
+    }
 }
 
 // MARK: - CLLocationManagerDelegate
@@ -1801,5 +2074,21 @@ extension LocationTracker: CLLocationManagerDelegate {
                 pushSync(toast: nil)
             }
         }
+    }
+}
+
+
+/// v55: delegate for the SLC manager ONLY. The ride manager's
+/// delegate methods live on LocationTracker itself; SLC traffic never
+/// touches them (the ride delegate drops fixes when no ride is live,
+/// which is exactly why the fence fix is collected here instead).
+private final class SlcLocationDelegate: NSObject, CLLocationManagerDelegate {
+    var onLocations: (([CLLocation]) -> Void)?
+    var onFailure: (() -> Void)?
+    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        onLocations?(locations)
+    }
+    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        onFailure?()
     }
 }

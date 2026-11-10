@@ -69,6 +69,10 @@ final class RideState {
     var schedOff2 = 1110
     var schedWeekdaysOnly = true
     var scheduledRide = false
+    // v55: this ride was started by the SLC auto-start evaluator —
+    // subject to the 15-minute no-progress abandon. Stamped ONLY via
+    // the one-shot flag consumed in createFreshRide.
+    var slcStarted = false
     var stops: [RideStop] = []
     // Unified ride-state identity (Phase 1, shadow mode): stamped fresh at
     // ride start, carried across applyConfig progress merges, persisted
@@ -125,6 +129,7 @@ final class RideState {
         schedOff2 = json["schedOff2"] as? Int ?? 1110
         schedWeekdaysOnly = json["schedWeekdaysOnly"] as? Bool ?? true
         scheduledRide = json["scheduledRide"] as? Bool ?? false
+        slcStarted = json["slcStarted"] as? Bool ?? false
         rideId = json["rideId"] as? String ?? ""
         if let v = json["startedAt"] as? Int {
             startedAt = v
@@ -179,6 +184,7 @@ final class RideState {
             "schedOff2": schedOff2,
             "schedWeekdaysOnly": schedWeekdaysOnly,
             "scheduledRide": scheduledRide,
+            "slcStarted": slcStarted,
             "rideId": rideId,
             "startedAt": startedAt,
             "startSource": startSource,
