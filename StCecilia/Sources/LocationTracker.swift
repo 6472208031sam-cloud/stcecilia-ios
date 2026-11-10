@@ -1998,7 +1998,14 @@ final class LocationTracker: NSObject {
         r.revision += 1
         EndedStore.save(r)
         RideStore.clear()
-        teardownLiveRide()
+        // StC has no teardownLiveRide() helper — the teardown is
+        // inlined, exactly as this app's skip-final ending does it.
+        LiveActivityManager.shared.end(rideId: r.rideId)
+        markPositionInactive(ride: r)
+        ride = nil
+        nearCounts = []
+        manager.stopUpdatingLocation()
+        removeStartNote()
         nativeLog("SNAP", snapLogLine(ride: r, state: "ended"))
         jsEval?("if (typeof nativeNoRide === 'function') { try { nativeNoRide(); } catch(e){} }")
         return true
