@@ -37,6 +37,12 @@ final class LocationTracker: NSObject {
     private var posGoodLng = 0.0
     private var posGoodAcc = 0.0
     private var posGoodTime = Date.distantPast
+    // v56: speed (m/s) of the last accuracy-passing fix, taken from
+    // the fix itself; negative = that fix carried no valid speed.
+    // posPendingSpeedMs is set by handleLocation just before the
+    // position write, from the CLLocation it is processing.
+    private var posGoodSpeedMs = -1.0
+    private var posPendingSpeedMs = -1.0
     private var posTimer: DispatchSourceTimer?
     private var posTimerRideId = ""
     /// v46: stamp (Toronto day + minute) of the last off-stop tick
@@ -60,6 +66,26 @@ final class LocationTracker: NSObject {
     /// background state — the launch activation check then logs its
     /// verdict but never fires and never consumes an occurrence.
     var launchDeferred = false
+    /// v56: true while a ride is live (not ended / not completed).
+    var hasLiveRide: Bool {
+        if let r = ride { return !r.ended && !r.completed }
+        return false
+    }
+    // v56: idle check-in writer state — an in-flight collection
+    // guard, the config captured at attempt time, the last
+    // successful write (90 s cross-trigger dedupe), a stashed SLC
+    // triggering fix, and a flag noting an SLC batch arrived while
+    // a check-in collection owned the SLC manager (the wake is
+    // re-run once after the collection ends).
+    private var chkCollecting = false
+    private var chkBestFix: CLLocation?
+    private var chkDeadline: DispatchWorkItem?
+    private var chkSource = ""
+    private var chkCfg: RideState?
+    private var chkCompletion: (() -> Void)?
+    private var chkSawSlcBatch = false
+    private var chkLastWriteAt = Date.distantPast
+    private var slcTriggerFix: CLLocation?
     // Phase 4 ENABLE: one-stop restore recovery evaluation.
     // Armed ONLY in restore() when a persisted ride resumes after
     // process death; evaluated once (immediately for the final-stop /
@@ -229,6 +255,8 @@ final class LocationTracker: NSObject {
 
     private override init() {
         super.init()
+        // v56: battery level for check-in records (unknown = omitted).
+        UIDevice.current.isBatteryMonitoringEnabled = true
         manager.delegate = self
         manager.desiredAccuracy = kCLLocationAccuracyBest
         manager.distanceFilter = 5
@@ -324,6 +352,7 @@ final class LocationTracker: NSObject {
             posRideEnded = false
             posLastSend = Date.distantPast
             posGoodTime = Date.distantPast
+            posGoodSpeedMs = -1
             armPosTimer(rideId: r.rideId)
         }
         // v53: a marked ride sends nothing more — not even this fix.
@@ -336,6 +365,7 @@ final class LocationTracker: NSObject {
         posGoodLng = lng
         posGoodAcc = accuracy
         posGoodTime = now
+        posGoodSpeedMs = posPendingSpeedMs
         let dist = posSentThisRide ? haversine(lat1: posLastLat, lon1: posLastLng, lat2: lat, lon2: lng) : 0
         let dt = posSentThisRide ? now.timeIntervalSince(posLastSend) : Double.infinity
         let due = !posSentThisRide || dist >= 100 || (dist >= 25 && dt >= 5) || dt >= 30
@@ -344,7 +374,7 @@ final class LocationTracker: NSObject {
         posLastLng = lng
         posLastSend = now
         posSentThisRide = true
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "tag": r.deviceId,
             "label": r.deviceLabel,
             "route": r.tab,
@@ -354,9 +384,14 @@ final class LocationTracker: NSObject {
             "ts": Int(now.timeIntervalSince1970 * 1000),
             "active": true,
         ]
+        // v56: writer-reported speed (km/h, whole) from the fix;
+        // an invalid fix speed omits the field entirely.
+        let spdKmh: Int? = posPendingSpeedMs >= 0 ? Int((posPendingSpeedMs * 3.6).rounded()) : nil
+        if let s = spdKmh { body["spd"] = s }
+        let spdLog = spdKmh.map { String($0) } ?? "-"
         FirebaseClient.put(base: r.fbBase, path: r.fbPath, tag: r.deviceId, body: body) { [weak self] code in
             DispatchQueue.main.async {
-                self?.nativeLog("POS", "put (\(code ?? -1)) dist=\(Int(dist.rounded()))m dt=\(dt == .infinity ? -1 : Int(dt))s")
+                self?.nativeLog("POS", "put (\(code ?? -1)) dist=\(Int(dist.rounded()))m dt=\(dt == .infinity ? -1 : Int(dt))s spd=\(spdLog)")
             }
         }
     }
@@ -403,7 +438,7 @@ final class LocationTracker: NSObject {
         posLastLng = posGoodLng
         posLastSend = now
         posSentThisRide = true
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "tag": r.deviceId,
             "label": r.deviceLabel,
             "route": r.tab,
@@ -413,9 +448,18 @@ final class LocationTracker: NSObject {
             "ts": Int(now.timeIntervalSince1970 * 1000),
             "active": true,
         ]
+        // v56: a heartbeat re-send reports the cached fix's speed
+        // while that fix is fresh (<=30 s old); once the fix has
+        // aged past that the phone is taken as stopped and the
+        // heartbeat reports a real 0. No cached speed at all (the
+        // fix carried none) still omits the field.
+        let hbSpd: Int? = now.timeIntervalSince(posGoodTime) > 30 ? 0
+            : (posGoodSpeedMs >= 0 ? Int((posGoodSpeedMs * 3.6).rounded()) : nil)
+        if let s = hbSpd { body["spd"] = s }
+        let hbSpdLog = hbSpd.map { String($0) } ?? "-"
         FirebaseClient.put(base: r.fbBase, path: r.fbPath, tag: r.deviceId, body: body) { [weak self] code in
             DispatchQueue.main.async {
-                self?.nativeLog("POS", "put (\(code ?? -1)) dist=0m dt=\(Int(sinceSend))s")
+                self?.nativeLog("POS", "put (\(code ?? -1)) dist=0m dt=\(Int(sinceSend))s spd=\(hbSpdLog)")
             }
         }
     }
@@ -1440,6 +1484,7 @@ final class LocationTracker: NSObject {
 
         // Live Tracker (v50): the position write goes last — after all
         // arrival processing — and never blocks it.
+        posPendingSpeedMs = loc.speed
         maybeSendPosition(lat: lat, lng: lng, accuracy: accuracy, ride: r)
     }
 
@@ -1810,6 +1855,147 @@ final class LocationTracker: NSObject {
     /// Arm/disarm significant-location-change monitoring. Callers:
     /// ScheduleManager.apply (the config push) passes the schedule
     /// toggle; didFinishLaunching re-asserts from the stored toggle.
+    // MARK: - v56 idle check-ins
+    //
+    // On the wakes the app already gets (user opens, background
+    // refresh, SLC events, location relaunches), the native side
+    // writes {tag, label, app, lat, lng, acc, ts, batt?, chg, src}
+    // to the checkins branch beside the position branches — never
+    // touching ride positions, followers or ride state. Idle only:
+    // no writes while a ride is live; an SLC wake that starts a
+    // ride writes none; the follower-alerts toggle governs, like
+    // every other report this phone makes. History is kept (the
+    // watcher page browses the last 30 days); there is no prune.
+    // A check-in always carries a FRESH fix: collection windows
+    // are short (~8 s, early finish at <=50 m) and a fix coarser
+    // than 500 m counts as no fix at all.
+
+    /// The stored page config carrying the writer inputs (fbBase /
+    /// fbPath / deviceId / deviceLabel / followerOn), page-free.
+    private func chkConfig() -> RideState? {
+        for page in ["pm", "am"] {
+            if let jsonStr = ScheduleManager.shared.configJSON(forTab: page),
+               let data = jsonStr.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                let cfg = RideState(json: obj)
+                if !cfg.fbBase.isEmpty, !cfg.fbPath.isEmpty, !cfg.deviceId.isEmpty { return cfg }
+            }
+        }
+        return nil
+    }
+
+    /// Shared gates for every check-in attempt: config present,
+    /// follower toggle on, no successful write in the last 90 s.
+    private func chkGates() -> RideState? {
+        guard let cfg = chkConfig() else { nativeLog("CHK", "skip - no config"); return nil }
+        guard cfg.followerOn else { nativeLog("CHK", "skip - follower alerts off"); return nil }
+        if Date().timeIntervalSince(chkLastWriteAt) < 90 { nativeLog("CHK", "skip - recent write"); return nil }
+        return cfg
+    }
+
+    /// Check-in attempt with a fix already in hand (SLC-sourced:
+    /// the wake's triggering fix, or the fence's judged fix on a
+    /// reject — the fence evaluation always runs FIRST).
+    private func chkWriteWithFix(source: String, fix: CLLocation?) {
+        if hasLiveRide { nativeLog("CHK", "skip - ride live"); return }
+        guard let cfg = chkGates() else { return }
+        guard let f = fix, f.horizontalAccuracy >= 0, f.horizontalAccuracy <= 500,
+              Date().timeIntervalSince(f.timestamp) <= 120 else {
+            nativeLog("CHK", "skip - no fix"); return
+        }
+        chkPut(cfg: cfg, source: source, fix: f, completion: nil)
+    }
+
+    /// Check-in attempt that needs a fresh fix: a short collection
+    /// on the SLC manager. snapshotIdle is the caller's entry
+    /// snapshot (opens): idle-on-arrival writes even when the open
+    /// itself then fires a scheduled ride. The collection never
+    /// delays ride or activation work — it runs alongside it.
+    func chkAttempt(source: String, snapshotIdle: Bool, completion: (() -> Void)? = nil) {
+        if !snapshotIdle, hasLiveRide {
+            nativeLog("CHK", "skip - ride live")
+            completion?()
+            return
+        }
+        guard let cfg = chkGates() else { completion?(); return }
+        guard !chkCollecting, !slcCollecting, !slcEvaluating else {
+            nativeLog("CHK", "skip - busy")
+            completion?()
+            return
+        }
+        chkCollecting = true
+        chkBestFix = nil
+        chkSource = source
+        chkCfg = cfg
+        chkCompletion = completion
+        chkSawSlcBatch = false
+        slcManager.desiredAccuracy = kCLLocationAccuracyBest
+        slcManager.startUpdatingLocation()
+        let deadline = DispatchWorkItem { [weak self] in self?.chkFinishCollect() }
+        chkDeadline = deadline
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: deadline)
+    }
+
+    private func chkFinishCollect() {
+        guard chkCollecting else { return }
+        chkDeadline?.cancel()
+        chkDeadline = nil
+        chkCollecting = false
+        slcManager.stopUpdatingLocation()
+        slcManager.desiredAccuracy = kCLLocationAccuracyHundredMeters
+        let completion = chkCompletion
+        chkCompletion = nil
+        let sawSlc = chkSawSlcBatch
+        chkSawSlcBatch = false
+        let cfg = chkCfg
+        chkCfg = nil
+        if let cfg = cfg, let f = chkBestFix, f.horizontalAccuracy >= 0, f.horizontalAccuracy <= 500 {
+            chkPut(cfg: cfg, source: chkSource, fix: f, completion: completion)
+        } else {
+            nativeLog("CHK", "skip - no fix")
+            completion?()
+        }
+        if sawSlc { slcWake() }
+    }
+
+    private func chkPut(cfg: RideState, source: String, fix: CLLocation, completion: (() -> Void)?) {
+        let parent = cfg.fbPath.split(separator: "/").dropLast().joined(separator: "/")
+        guard !parent.isEmpty else { nativeLog("CHK", "skip - no config"); completion?(); return }
+        let tsMs = Int(fix.timestamp.timeIntervalSince1970 * 1000)
+        var body: [String: Any] = [
+            "tag": cfg.deviceId,
+            "label": cfg.deviceLabel,
+            "app": "stc",
+            "lat": fix.coordinate.latitude,
+            "lng": fix.coordinate.longitude,
+            "acc": Int(fix.horizontalAccuracy.rounded()),
+            "ts": tsMs,
+            "src": source,
+        ]
+        // Battery: an unknown level is OMITTED, never a placeholder.
+        let lvl = UIDevice.current.batteryLevel
+        var battLog = "-"
+        if lvl >= 0 {
+            let p = Int((lvl * 100).rounded())
+            body["batt"] = p
+            battLog = "\(p)%"
+        }
+        let st = UIDevice.current.batteryState
+        body["chg"] = (st == .charging || st == .full)
+        let path = parent + "/checkins/" + cfg.deviceId + "/" + torontoDayKey(fix.timestamp)
+        FirebaseClient.put(base: cfg.fbBase, path: path, tag: String(tsMs), body: body) { [weak self] code in
+            DispatchQueue.main.async {
+                if code == 200 {
+                    self?.chkLastWriteAt = Date()
+                    self?.nativeLog("CHK", "wrote source=\(source) batt=\(battLog) acc=\(Int(fix.horizontalAccuracy.rounded()))m (200)")
+                } else {
+                    self?.nativeLog("CHK", "FAILED source=\(source) code=\(code ?? -1)")
+                }
+                completion?()
+            }
+        }
+    }
+
     func updateSlcArming(enabled: Bool) {
         if enabled {
             guard CLLocationManager.significantLocationChangeMonitoringAvailable() else {
@@ -1832,6 +2018,21 @@ final class LocationTracker: NSObject {
     }
 
     private func slcLocations(_ locations: [CLLocation]) {
+        if chkCollecting {
+            // v56: a check-in collection owns the SLC manager (<=8 s):
+            // batches feed it, never slcWake — the collector's own
+            // fixes must not trigger fence evaluations. The wake is
+            // re-run once when the collection ends (chkSawSlcBatch).
+            for loc in locations {
+                if loc.horizontalAccuracy >= 0,
+                   chkBestFix == nil || loc.horizontalAccuracy < chkBestFix!.horizontalAccuracy {
+                    chkBestFix = loc
+                }
+            }
+            chkSawSlcBatch = true
+            if let b = chkBestFix, b.horizontalAccuracy <= 50 { chkFinishCollect() }
+            return
+        }
         if slcCollecting {
             for loc in locations {
                 if loc.horizontalAccuracy >= 0,
@@ -1842,6 +2043,7 @@ final class LocationTracker: NSObject {
             if let b = slcBestFix, b.horizontalAccuracy <= 50 { slcFinishCollect() }
             return
         }
+        slcTriggerFix = locations.last
         slcWake()
     }
 
@@ -1857,21 +2059,25 @@ final class LocationTracker: NSObject {
         guard !slcEvaluating else { return }
         if let r = ride, !r.ended, !r.completed {
             nativeLog("SLC", "wake ignored - live ride \(String(r.rideId.prefix(8)))")
+            nativeLog("CHK", "skip - ride live")
             return
         }
         guard slcManager.authorizationStatus == .authorizedAlways else {
             nativeLog("SLC", "wake ignored - location auth not Always")
+            chkWriteWithFix(source: "slc", fix: slcTriggerFix)
             return
         }
         let d = UserDefaults.standard
         guard d.bool(forKey: "stcecilia_sched_enabled") else {
             nativeLog("SLC", "wake ignored - schedule disabled")
+            chkWriteWithFix(source: "slc", fix: slcTriggerFix)
             return
         }
         if d.bool(forKey: "stcecilia_sched_weekdays") {
             let wd = torontoCalendar.component(.weekday, from: Date())
             if wd == 1 || wd == 7 {
                 nativeLog("SLC", "wake ignored - weekend, weekdays-only")
+                chkWriteWithFix(source: "slc", fix: slcTriggerFix)
                 return
             }
         }
@@ -1879,10 +2085,12 @@ final class LocationTracker: NSObject {
         let nowMin = torontoMinutes(Date())
         guard nowMin >= window.on - 5, nowMin <= window.off else {
             nativeLog("SLC", "wake ignored - outside PM window [\(window.on - 5),\(window.off)] now=\(nowMin)")
+            chkWriteWithFix(source: "slc", fix: slcTriggerFix)
             return
         }
         if schedConsumed(page: "pm") {
             nativeLog("SLC", "wake ignored - PM occurrence consumed")
+            chkWriteWithFix(source: "slc", fix: slcTriggerFix)
             return
         }
         nativeLog("SLC", "wake - evaluating (PM window [\(window.on - 5),\(window.off)])")
@@ -1938,6 +2146,7 @@ final class LocationTracker: NSObject {
             pendingSlcStart = false
         } else {
             nativeLog("SLC", "fence REJECT dist=\(Int(dist))m acc=\(Int(acc))m (>500m from route start line)")
+            chkWriteWithFix(source: "slc", fix: slcBestFix)
         }
     }
 

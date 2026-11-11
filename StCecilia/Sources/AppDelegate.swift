@@ -18,6 +18,16 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
         // Resume a persisted ride if the app was terminated mid-ride
         // (mirrors Android's START_STICKY service restart).
         LocationTracker.shared.restore()
+        // v56: idle check-in on a user open — the entry state is
+        // snapshotted HERE, before the activation check below can
+        // fire a scheduled ride (snapshot-at-entry: idle on
+        // arrival writes, then the ride starts). A background
+        // (location) relaunch is a wake, not an open.
+        if application.applicationState != .background {
+            LocationTracker.shared.chkAttempt(source: "open", snapshotIdle: !LocationTracker.shared.hasLiveRide)
+        } else if launchOptions?[.location] != nil {
+            LocationTracker.shared.chkAttempt(source: "wake", snapshotIdle: false)
+        }
         // v55: re-assert SLC arming from the stored schedule toggle.
         LocationTracker.shared.assertSlcArming()
         if launchOptions?[.location] != nil {
@@ -113,18 +123,23 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
         LocationTracker.shared.schedLog("BG refresh fired - re-arming schedule")
         // Phase 2: reconcile ride state before re-arming the schedule.
         LocationTracker.shared.reconcile()
-        refreshTask.expirationHandler = {
-            LocationTracker.shared.schedLog("BG refresh expired before re-arm finished")
-        }
-        ScheduleManager.shared.schedule {
-            scheduleAppRefresh()
-            refreshTask.setTaskCompleted(success: true)
+        // v56: the refresh wake also leaves a check-in; the task
+        // completes only after the (<=8 s) collection resolves, so
+        // the write is issued inside the task window.
+        LocationTracker.shared.chkAttempt(source: "refresh", snapshotIdle: false) {
+            ScheduleManager.shared.schedule {
+                scheduleAppRefresh()
+                refreshTask.setTaskCompleted(success: true)
+            }
         }
     }
 
     func applicationWillEnterForeground(_ application: UIApplication) {
         // Warm reopen inside a schedule window rescues a missed banner:
         // same activation check as launch (logs a verdict either way).
+        // v56: entry snapshot + check-in attempt FIRST, before the
+        // activation check can fire a ride on this same foreground.
+        LocationTracker.shared.chkAttempt(source: "open", snapshotIdle: !LocationTracker.shared.hasLiveRide)
         LocationTracker.shared.checkScheduleOnActivation(source: "foreground")
         // v55 (F2): adopt the Live Activity of a live ride (e.g. an
         // SLC-started one) \u2014 start hook only, never the sweep.
