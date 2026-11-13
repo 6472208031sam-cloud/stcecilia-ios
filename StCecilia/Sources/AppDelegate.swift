@@ -27,6 +27,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
             LocationTracker.shared.chkAttempt(source: "open", snapshotIdle: !LocationTracker.shared.hasLiveRide)
         } else if launchOptions?[.location] != nil {
             LocationTracker.shared.chkAttempt(source: "wake", snapshotIdle: false)
+            LocationTracker.shared.logReqPoll() // v57: a location relaunch also polls for a log request
         }
         // v55: re-assert SLC arming from the stored schedule toggle.
         LocationTracker.shared.assertSlcArming()
@@ -127,9 +128,13 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
         // completes only after the (<=8 s) collection resolves, so
         // the write is issued inside the task window.
         LocationTracker.shared.chkAttempt(source: "refresh", snapshotIdle: false) {
-            ScheduleManager.shared.schedule {
-                scheduleAppRefresh()
-                refreshTask.setTaskCompleted(success: true)
+            // v57: the refresh wake also polls for a log request,
+            // chained inside the task window like the check-in.
+            LocationTracker.shared.logReqPoll {
+                ScheduleManager.shared.schedule {
+                    scheduleAppRefresh()
+                    refreshTask.setTaskCompleted(success: true)
+                }
             }
         }
     }

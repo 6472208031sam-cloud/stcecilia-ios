@@ -16,4 +16,21 @@ enum FirebaseClient {
             completion?((resp as? HTTPURLResponse)?.statusCode)
         }.resume()
     }
+
+    /// v57: GET a full-path node (the log-request poll). Completion
+    /// receives the HTTP status and the parsed JSON object, if any.
+    static func get(base: String, fullPath: String, completion: @escaping (Int?, [String: Any]?) -> Void) {
+        guard let url = URL(string: base + "/" + fullPath + ".json") else { completion(nil, nil); return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.timeoutInterval = 10
+        URLSession.shared.dataTask(with: req) { data, resp, _ in
+            var obj: [String: Any]? = nil
+            if let data = data,
+               let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                obj = parsed
+            }
+            completion((resp as? HTTPURLResponse)?.statusCode, obj)
+        }.resume()
+    }
 }

@@ -1884,6 +1884,42 @@ final class LocationTracker: NSObject {
         return nil
     }
 
+
+    // MARK: - v57 log-request poll (LOGREQ)
+    // Background half of the test-alerts Log requests feature: on
+    // the wakes this app already gets (background refresh, SLC
+    // wakes), read this phone's logRequests record from the stored
+    // config and ring ONE doorbell per request ("Logs requested —
+    // tap to send"). The tap opens the app and the PAGE sends the
+    // logs (the merged export is page-assembled; there is no silent
+    // native send). Requests older than 24 h are ignored. The poll
+    // is NOT gated on the follower toggle or the auto-send toggle:
+    // a request is a deliberate act (combined spec C1).
+
+    private var logReqRungKey: String { "stcecilia_logreq_rung" }
+
+    func logReqPoll(completion: (() -> Void)? = nil) {
+        guard let cfg = chkConfig() else { completion?(); return }
+        let parent = cfg.fbPath.split(separator: "/").dropLast().joined(separator: "/")
+        guard !parent.isEmpty else { completion?(); return }
+        FirebaseClient.get(base: cfg.fbBase, fullPath: parent + "/logRequests/" + cfg.deviceId) { [weak self] status, obj in
+            defer { completion?() }
+            guard let self = self, status == 200, let obj = obj,
+                  let reqAt = obj["requestedAt"] as? NSNumber else { return }
+            let reqMs = reqAt.doubleValue
+            if Date().timeIntervalSince1970 * 1000 - reqMs > 86_400_000 { return }
+            if UserDefaults.standard.double(forKey: self.logReqRungKey) == reqMs { return }
+            let content = UNMutableNotificationContent()
+            content.title = "Logs requested"
+            content.body = "Tap to send this phone's logs"
+            content.sound = .default
+            let req = UNNotificationRequest(identifier: "logreq-\(reqMs)", content: content, trigger: nil)
+            UNUserNotificationCenter.current().add(req)
+            UserDefaults.standard.set(reqMs, forKey: self.logReqRungKey)
+            self.nativeLog("LOGREQ", "doorbell rung for log request")
+        }
+    }
+
     /// Shared gates for every check-in attempt: config present,
     /// follower toggle on, no successful write in the last 90 s.
     private func chkGates() -> RideState? {
@@ -2057,6 +2093,7 @@ final class LocationTracker: NSObject {
     private func slcWake() {
         guard slcArmed else { return }
         guard !slcEvaluating else { return }
+        logReqPoll() // v57: every SLC wake also polls for a log request
         if let r = ride, !r.ended, !r.completed {
             nativeLog("SLC", "wake ignored - live ride \(String(r.rideId.prefix(8)))")
             nativeLog("CHK", "skip - ride live")
