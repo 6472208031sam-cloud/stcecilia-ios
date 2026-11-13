@@ -17,6 +17,21 @@ enum FirebaseClient {
         }.resume()
     }
 
+    /// v58: PUT a bare JSON number at a full-path node (the Phone
+    /// Presence poll stamp: presence/<tag>/poll = epoch ms). The
+    /// dict-bodied put() cannot express a bare value.
+    static func putValue(base: String, fullPath: String, value: Int64, completion: ((Int?) -> Void)? = nil) {
+        guard let url = URL(string: base + "/" + fullPath + ".json") else { completion?(nil); return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "PUT"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = String(value).data(using: .utf8)
+        req.timeoutInterval = 10
+        URLSession.shared.dataTask(with: req) { _, resp, _ in
+            completion?((resp as? HTTPURLResponse)?.statusCode)
+        }.resume()
+    }
+
     /// v57: GET a full-path node (the log-request poll). Completion
     /// receives the HTTP status and the parsed JSON object, if any.
     static func get(base: String, fullPath: String, completion: @escaping (Int?, [String: Any]?) -> Void) {

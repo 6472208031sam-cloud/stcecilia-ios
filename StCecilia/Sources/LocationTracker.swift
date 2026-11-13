@@ -1902,6 +1902,10 @@ final class LocationTracker: NSObject {
         guard let cfg = chkConfig() else { completion?(); return }
         let parent = cfg.fbPath.split(separator: "/").dropLast().joined(separator: "/")
         guard !parent.isEmpty else { completion?(); return }
+        // v58: Phone Presence poll stamp — every poll stamps,
+        // request or not (bare epoch-ms at presence/<tag>/poll;
+        // the page writes the sibling 'page' child).
+        FirebaseClient.putValue(base: cfg.fbBase, fullPath: parent + "/presence/" + cfg.deviceId + "/poll", value: Int64(Date().timeIntervalSince1970 * 1000))
         FirebaseClient.get(base: cfg.fbBase, fullPath: parent + "/logRequests/" + cfg.deviceId) { [weak self] status, obj in
             defer { completion?() }
             guard let self = self, status == 200, let obj = obj,
