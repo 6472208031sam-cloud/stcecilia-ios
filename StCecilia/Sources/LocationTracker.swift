@@ -1906,6 +1906,9 @@ final class LocationTracker: NSObject {
         // request or not (bare epoch-ms at presence/<tag>/poll;
         // the page writes the sibling 'page' child).
         FirebaseClient.putValue(base: cfg.fbBase, fullPath: parent + "/presence/" + cfg.deviceId + "/poll", value: Int64(Date().timeIntervalSince1970 * 1000))
+        // v59: Presence Toggle State — the follower-alerts toggle
+        // rides beside the poll stamp (cfg.followerOn, ungated).
+        FirebaseClient.putBool(base: cfg.fbBase, fullPath: parent + "/presence/" + cfg.deviceId + "/alerts", value: cfg.followerOn)
         FirebaseClient.get(base: cfg.fbBase, fullPath: parent + "/logRequests/" + cfg.deviceId) { [weak self] status, obj in
             defer { completion?() }
             guard let self = self, status == 200, let obj = obj,

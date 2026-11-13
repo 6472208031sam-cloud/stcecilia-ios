@@ -32,6 +32,21 @@ enum FirebaseClient {
         }.resume()
     }
 
+    /// v59: PUT a bare JSON boolean at a full-path node (the
+    /// Presence Toggle State stamp: presence/<tag>/alerts). The
+    /// dict-bodied put() and the Int64 putValue() cannot express it.
+    static func putBool(base: String, fullPath: String, value: Bool, completion: ((Int?) -> Void)? = nil) {
+        guard let url = URL(string: base + "/" + fullPath + ".json") else { completion?(nil); return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "PUT"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = (value ? "true" : "false").data(using: .utf8)
+        req.timeoutInterval = 10
+        URLSession.shared.dataTask(with: req) { _, resp, _ in
+            completion?((resp as? HTTPURLResponse)?.statusCode)
+        }.resume()
+    }
+
     /// v57: GET a full-path node (the log-request poll). Completion
     /// receives the HTTP status and the parsed JSON object, if any.
     static func get(base: String, fullPath: String, completion: @escaping (Int?, [String: Any]?) -> Void) {
