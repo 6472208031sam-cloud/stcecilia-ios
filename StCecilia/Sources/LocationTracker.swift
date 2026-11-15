@@ -1961,7 +1961,7 @@ final class LocationTracker: NSObject {
         }
     }
 
-    private func handleStartRequest(cfg: RideState, parent: String, status: Int, obj: [String: Any]?) {
+    private func handleStartRequest(cfg: RideState, parent: String, status: Int?, obj: [String: Any]?) {
         guard status == 200, let obj = obj, obj["status"] == nil,
               let reqAt = obj["requestedAt"] as? NSNumber else { return }
         let reqMs = reqAt.doubleValue
