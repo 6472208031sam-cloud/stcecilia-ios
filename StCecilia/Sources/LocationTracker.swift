@@ -1910,21 +1910,161 @@ final class LocationTracker: NSObject {
         // rides beside the poll stamp (cfg.followerOn, ungated).
         FirebaseClient.putBool(base: cfg.fbBase, fullPath: parent + "/presence/" + cfg.deviceId + "/alerts", value: cfg.followerOn)
         FirebaseClient.get(base: cfg.fbBase, fullPath: parent + "/logRequests/" + cfg.deviceId) { [weak self] status, obj in
-            defer { completion?() }
-            guard let self = self, status == 200, let obj = obj,
-                  let reqAt = obj["requestedAt"] as? NSNumber else { return }
-            let reqMs = reqAt.doubleValue
-            if Date().timeIntervalSince1970 * 1000 - reqMs > 86_400_000 { return }
-            if UserDefaults.standard.double(forKey: self.logReqRungKey) == reqMs { return }
-            let content = UNMutableNotificationContent()
-            content.title = "Logs requested"
-            content.body = "Tap to send this phone's logs"
-            content.sound = .default
-            let req = UNNotificationRequest(identifier: "logreq-\(reqMs)", content: content, trigger: nil)
-            UNUserNotificationCenter.current().add(req)
-            UserDefaults.standard.set(reqMs, forKey: self.logReqRungKey)
-            self.nativeLog("LOGREQ", "doorbell rung for log request")
+            guard let self = self else { completion?(); return }
+            if status == 200, let obj = obj, let reqAt = obj["requestedAt"] as? NSNumber {
+                let reqMs = reqAt.doubleValue
+                if Date().timeIntervalSince1970 * 1000 - reqMs <= 86_400_000,
+                   UserDefaults.standard.double(forKey: self.logReqRungKey) != reqMs {
+                    let content = UNMutableNotificationContent()
+                    content.title = "Logs requested"
+                    content.body = "Tap to send this phone's logs"
+                    content.sound = .default
+                    let req = UNNotificationRequest(identifier: "logreq-\(reqMs)", content: content, trigger: nil)
+                    UNUserNotificationCenter.current().add(req)
+                    UserDefaults.standard.set(reqMs, forKey: self.logReqRungKey)
+                    self.nativeLog("LOGREQ", "doorbell rung for log request")
+                }
+            }
+            // v60: the same wake also checks for panel start/locate
+            // requests; the chain's completion fires at its end.
+            self.remoteChecks(cfg: cfg, parent: parent, completion: completion)
         }
+    }
+
+    // MARK: - v60 remote start + locate (REMOTESTART / LOCATE)
+    // Panel v2.36 writes startRequests/<tag> and locateRequests/<tag>
+    // ({requestedAt, app}, 60-minute life). Every wake that runs the
+    // log-request poll also checks both. A start self-starts the ride
+    // through the proven startRide path (route half by this phone's
+    // Toronto clock), posts the "Ride started from the panel" banner,
+    // and acks back ON the record — {status, at, dark} — LEAVING the
+    // record settled for the panel to clear once shown (R1). Alerts
+    // off still starts: the ride runs dark (S5). A locate answers
+    // silently with a fresh fix at the panel-only locate/<tag>
+    // record, tagged with the request it answers (reqAt).
+
+    private var startRungKey: String { "stcecilia_start_rung" }
+    private var locCollecting = false
+    private var locBestFix: CLLocation?
+    private var locCfg: RideState?
+    private var locParent = ""
+    private var locReqMs: Double = 0
+    private var locCompletion: (() -> Void)?
+    private var locDeadline: DispatchWorkItem?
+    private var locSawSlcBatch = false
+
+    private func remoteChecks(cfg: RideState, parent: String, completion: (() -> Void)?) {
+        FirebaseClient.get(base: cfg.fbBase, fullPath: parent + "/startRequests/" + cfg.deviceId) { [weak self] status, obj in
+            guard let self = self else { completion?(); return }
+            self.handleStartRequest(cfg: cfg, parent: parent, status: status, obj: obj)
+            self.locateCheck(cfg: cfg, parent: parent, completion: completion)
+        }
+    }
+
+    private func handleStartRequest(cfg: RideState, parent: String, status: Int, obj: [String: Any]?) {
+        guard status == 200, let obj = obj, obj["status"] == nil,
+              let reqAt = obj["requestedAt"] as? NSNumber else { return }
+        let reqMs = reqAt.doubleValue
+        if Date().timeIntervalSince1970 * 1000 - reqMs > 3_600_000 { return }
+        let appSlug = cfg.fbPath.split(separator: "/").last.map(String.init) ?? ""
+        if (obj["app"] as? String) != appSlug { return }
+        if UserDefaults.standard.double(forKey: startRungKey) == reqMs { return }
+        let dark = !cfg.followerOn
+        var statusStr = "started"
+        if hasLiveRide {
+            statusStr = "already-on-a-ride"
+        } else {
+            let page = torontoMinutes(Date()) < 720 ? "am" : "pm"
+            guard let jsonStr = ScheduleManager.shared.configJSON(forTab: page),
+                  startRide(configJson: jsonStr, scheduled: true) == "started" else {
+                nativeLog("REMOTESTART", "start failed - no stored config for page \(page)")
+                return
+            }
+            let content = UNMutableNotificationContent()
+            content.title = "Ride started from the panel"
+            content.body = "This ride was started remotely from Test Alerts & Phone Presence"
+            content.sound = .default
+            let req = UNNotificationRequest(identifier: "remotestart-\(reqMs)", content: content, trigger: nil)
+            UNUserNotificationCenter.current().add(req)
+        }
+        let ack: [String: Any] = ["requestedAt": Int64(reqMs), "app": appSlug, "status": statusStr,
+                                  "at": Int64(Date().timeIntervalSince1970 * 1000), "dark": dark]
+        FirebaseClient.put(base: cfg.fbBase, path: parent + "/startRequests", tag: cfg.deviceId, body: ack) { _ in }
+        UserDefaults.standard.set(reqMs, forKey: startRungKey)
+        nativeLog("REMOTESTART", "panel start request \(statusStr)\(dark ? " (dark)" : "")")
+    }
+
+    private func locateCheck(cfg: RideState, parent: String, completion: (() -> Void)?) {
+        FirebaseClient.get(base: cfg.fbBase, fullPath: parent + "/locateRequests/" + cfg.deviceId) { [weak self] status, obj in
+            guard let self = self else { completion?(); return }
+            guard status == 200, let obj = obj,
+                  let reqAt = obj["requestedAt"] as? NSNumber else { completion?(); return }
+            let reqMs = reqAt.doubleValue
+            if Date().timeIntervalSince1970 * 1000 - reqMs > 3_600_000 { completion?(); return }
+            let appSlug = cfg.fbPath.split(separator: "/").last.map(String.init) ?? ""
+            if (obj["app"] as? String) != appSlug { completion?(); return }
+            // The wake's own fix where the wake carries one (the SLC
+            // trigger fix), judged by the check-in sanity bounds.
+            if let f = self.slcTriggerFix, f.horizontalAccuracy >= 0, f.horizontalAccuracy <= 500,
+               Date().timeIntervalSince(f.timestamp) <= 120 {
+                self.locateAnswer(cfg: cfg, parent: parent, fix: f, reqMs: reqMs)
+                completion?()
+                return
+            }
+            guard !self.locCollecting, !self.chkCollecting, !self.slcCollecting, !self.slcEvaluating else {
+                self.nativeLog("LOCATE", "skip - busy")
+                completion?()
+                return
+            }
+            self.locCollecting = true
+            self.locBestFix = nil
+            self.locCfg = cfg
+            self.locParent = parent
+            self.locReqMs = reqMs
+            self.locCompletion = completion
+            self.locSawSlcBatch = false
+            self.slcManager.desiredAccuracy = kCLLocationAccuracyBest
+            self.slcManager.startUpdatingLocation()
+            let deadline = DispatchWorkItem { [weak self] in self?.locFinishCollect() }
+            self.locDeadline = deadline
+            DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: deadline)
+        }
+    }
+
+    private func locFinishCollect() {
+        guard locCollecting else { return }
+        locDeadline?.cancel()
+        locDeadline = nil
+        locCollecting = false
+        slcManager.stopUpdatingLocation()
+        slcManager.desiredAccuracy = kCLLocationAccuracyHundredMeters
+        let completion = locCompletion
+        locCompletion = nil
+        let sawSlc = locSawSlcBatch
+        locSawSlcBatch = false
+        let cfg = locCfg
+        locCfg = nil
+        if let cfg = cfg, let f = locBestFix, f.horizontalAccuracy >= 0, f.horizontalAccuracy <= 500,
+           Date().timeIntervalSince(f.timestamp) <= 120 {
+            locateAnswer(cfg: cfg, parent: locParent, fix: f, reqMs: locReqMs)
+        } else {
+            nativeLog("LOCATE", "skip - no fix")
+        }
+        locBestFix = nil
+        completion?()
+        if sawSlc { slcWake() }
+    }
+
+    private func locateAnswer(cfg: RideState, parent: String, fix: CLLocation, reqMs: Double) {
+        let body: [String: Any] = [
+            "lat": fix.coordinate.latitude,
+            "lng": fix.coordinate.longitude,
+            "acc": Int(fix.horizontalAccuracy.rounded()),
+            "ts": Int(fix.timestamp.timeIntervalSince1970 * 1000),
+            "reqAt": Int64(reqMs),
+        ]
+        FirebaseClient.put(base: cfg.fbBase, path: parent + "/locate", tag: cfg.deviceId, body: body) { _ in }
+        nativeLog("LOCATE", "locate answered acc=\(Int(fix.horizontalAccuracy.rounded()))m")
     }
 
     /// Shared gates for every check-in attempt: config present,
@@ -2061,6 +2201,21 @@ final class LocationTracker: NSObject {
     }
 
     private func slcLocations(_ locations: [CLLocation]) {
+        if locCollecting {
+            // v60: a locate collection owns the SLC manager (<=8 s):
+            // batches feed it, never slcWake — the collector's own
+            // fixes must not trigger fence evaluations. The wake is
+            // re-run once when the collection ends (locSawSlcBatch).
+            for loc in locations {
+                if loc.horizontalAccuracy >= 0,
+                   locBestFix == nil || loc.horizontalAccuracy < locBestFix!.horizontalAccuracy {
+                    locBestFix = loc
+                }
+            }
+            locSawSlcBatch = true
+            if let b = locBestFix, b.horizontalAccuracy <= 50 { locFinishCollect() }
+            return
+        }
         if chkCollecting {
             // v56: a check-in collection owns the SLC manager (<=8 s):
             // batches feed it, never slcWake — the collector's own
