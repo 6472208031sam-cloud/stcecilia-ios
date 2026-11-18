@@ -91,7 +91,7 @@ private final class LiveActivityEngine {
     private func makeState(_ ride: RideState) -> RideActivityAttributes.ContentState {
         let snap = LiveActivityManager.snapshot(for: ride)
         return RideActivityAttributes.ContentState(
-            statuses: snap.statuses, nextIndex: snap.next,
+            statuses: snap.statuses, nextIndex: ride.walkPhase ? -1 : snap.next,
             reachedCount: snap.reached, completed: ride.completed)
     }
 

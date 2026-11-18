@@ -59,6 +59,11 @@ final class RideState {
     var deviceLabel = ""
     var myStopAm = ""
     var myStopPm = ""
+    // v61: My Home Stop (PM walk-home phase). Flat config fields
+    // (0 = unset); walkPhase persists with the ride.
+    var homeLat = 0.0
+    var homeLng = 0.0
+    var walkPhase = false
     var followerOn = true
     var sound = false
     var snapDistance = 100.0
@@ -115,6 +120,17 @@ final class RideState {
             myStopAm = ms["am"] as? String ?? ""
             myStopPm = ms["pm"] as? String ?? ""
         }
+        if let d = json["homeLat"] as? Double {
+            homeLat = d
+        } else if let i = json["homeLat"] as? Int {
+            homeLat = Double(i)
+        }
+        if let d = json["homeLng"] as? Double {
+            homeLng = d
+        } else if let i = json["homeLng"] as? Int {
+            homeLng = Double(i)
+        }
+        walkPhase = json["walkPhase"] as? Bool ?? false
         followerOn = json["followerOn"] as? Bool ?? true
         sound = json["sound"] as? Bool ?? false
         if let d = json["snapDistance"] as? Double {
@@ -174,6 +190,9 @@ final class RideState {
             "deviceId": deviceId,
             "deviceLabel": deviceLabel,
             "myStop": ["am": myStopAm, "pm": myStopPm],
+            "homeLat": homeLat,
+            "homeLng": homeLng,
+            "walkPhase": walkPhase,
             "followerOn": followerOn,
             "sound": sound,
             "snapDistance": snapDistance,
