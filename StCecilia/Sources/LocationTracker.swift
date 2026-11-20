@@ -358,8 +358,6 @@ final class LocationTracker: NSObject {
             posGoodSpeedMs = -1
             armPosTimer(rideId: r.rideId)
         }
-        // v61: the walk-home phase publishes nothing (H4).
-        if r.walkPhase { return }
         // v53: a marked ride sends nothing more — not even this fix.
         if posRideEnded { return }
         guard r.followerOn, !r.fbBase.isEmpty, !r.fbPath.isEmpty, !r.deviceId.isEmpty else { return }
@@ -430,10 +428,6 @@ final class LocationTracker: NSObject {
 
     private func maybeTimerSend() {
         guard let r = ride, !r.completed, !r.ended, r.rideId == posTimerRideId else { stopPosTimer(); return }
-        // v61: the walk-home phase publishes nothing (H4). (The SLC
-        // abandon check below cannot fire in the phase — it requires
-        // zero reached stops, and got-off already reached one.)
-        if r.walkPhase { return }
         // v55: SLC abandon — evaluated ABOVE the follower/config
         // guard, so a follower-off phone still abandons its ride.
         if checkSlcAbandon() { return }
@@ -1745,9 +1739,10 @@ final class LocationTracker: NSObject {
         }
     }
 
-    /// v61: got-off with a home point set — the ride stays live but
-    /// private until the phone reaches the home point (My Home Stop,
-    /// H1/H4).
+    /// v61: got-off with a home point set — the ride stays live until
+    /// the phone reaches the home point (My Home Stop, H1/H4). v62
+    /// (H4 revision): publishing continues through the walk, exactly
+    /// as during a ride.
     private func enterWalkPhase(ride r: RideState) {
         DispatchQueue.main.async { [weak self] in
             guard let self = self, self.ride === r else { return }
@@ -1755,10 +1750,11 @@ final class LocationTracker: NSObject {
             self.homeNearCount = 0
             self.homeArrived = false
             self.persist()
-            // H4: the public side ends at got-off exactly as today.
-            self.markPositionInactive(ride: r)
+            // v62 (H4 revision): no mark-inactive here — the walk
+            // publishes exactly like a ride; the record closes at the
+            // true end (teardown / finalize).
             LiveActivityManager.shared.start(ride: r)
-            self.nativeLog("WALK", "walk-home phase started - tracking privately to the home point")
+            self.nativeLog("WALK", "walk-home phase started - publishing as usual until home")
         }
     }
 
