@@ -1453,9 +1453,15 @@ final class LocationTracker: NSObject {
         }
 
         // v61: in the walk-home phase, fixes test ONLY the home point —
-        // no snap, no stop arrivals, no look-ahead, no position writes.
+        // no snap, no stop arrivals, no look-ahead. v63: each fix also
+        // feeds the position writer (after the home test, and not on
+        // the arrival fix itself) so the walk publishes like a ride.
         if r.walkPhase {
             evaluateHomeArrival(loc: loc, accuracy: accuracy, ride: r)
+            if !homeArrived {
+                posPendingSpeedMs = loc.speed
+                maybeSendPosition(lat: lat, lng: lng, accuracy: accuracy, ride: r)
+            }
             return
         }
 
