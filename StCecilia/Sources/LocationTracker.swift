@@ -52,7 +52,7 @@ final class LocationTracker: NSObject {
     /// evaluation, so the location tick checks at most once a minute.
     private var lastOffCheckStamp = ""
     private var pendingConfig: String?
-    // v55: SLC auto-start (PM only). Own location manager + delegate,
+    // v55: SLC auto-start (PM fence; v64 adds the AM walk test). Own location manager + delegate,
     // so the ride-critical location path stays byte-untouched.
     private let slcManager = CLLocationManager()
     private var slcDelegate: SlcLocationDelegate?
@@ -61,6 +61,13 @@ final class LocationTracker: NSObject {
     private var slcCollecting = false
     private var slcBestFix: CLLocation?
     private var slcCollectDeadline: DispatchWorkItem?
+    // v64: which page the in-flight collection is judging ("pm" =
+    // the v55 fence; "am" = the walk test), plus the AM walk test's
+    // speed evidence gathered during the collection (usable fixes
+    // only: accuracy <= 250 m; speeds in m/s, negative = invalid).
+    private var slcEvalPage = "pm"
+    private var slcMaxSpeed = -1.0
+    private var slcSawWalk = false
     /// v55: one-shot flag — set by the evaluator immediately before
     /// it calls handleScheduleTap; consumed (and cleared) in
     /// createFreshRide, which stamps the new ride's slcStarted.
@@ -2319,7 +2326,16 @@ final class LocationTracker: NSObject {
     }
 
     func assertSlcArming() {
-        updateSlcArming(enabled: UserDefaults.standard.bool(forKey: "stcecilia_sched_enabled"))
+        updateSlcArming(enabled: UserDefaults.standard.bool(forKey: "stcecilia_sched_enabled") && slcSwitchOn())
+    }
+
+    /// v64: the page's SLC switch, stored by ScheduleManager.apply
+    /// from the ride config. Absent = ON. The St Cecilia page has
+    /// no SLC switch and never sends the key, so this stays ON
+    /// here — the helper exists to keep the evaluator identical
+    /// to the Bus app's, where the switch is real (Bus web v9.45).
+    func slcSwitchOn() -> Bool {
+        return UserDefaults.standard.object(forKey: "stcecilia_slc_enabled") as? Bool ?? true
     }
 
     private func slcLocations(_ locations: [CLLocation]) {
@@ -2359,6 +2375,11 @@ final class LocationTracker: NSObject {
                    slcBestFix == nil || loc.horizontalAccuracy < slcBestFix!.horizontalAccuracy {
                     slcBestFix = loc
                 }
+                // v64: AM walk-test speed evidence (PM ignores these).
+                if loc.horizontalAccuracy >= 0, loc.horizontalAccuracy <= 250 {
+                    if loc.speed > slcMaxSpeed { slcMaxSpeed = loc.speed }
+                    if loc.speed >= 0.3, loc.speed <= 2.5 { slcSawWalk = true }
+                }
             }
             if let b = slcBestFix, b.horizontalAccuracy <= 50 { slcFinishCollect() }
             return
@@ -2373,7 +2394,8 @@ final class LocationTracker: NSObject {
 
     /// An SLC event arrived (terminated-app relaunch or suspended-app
     /// wake). Gates first — cheap checks before spending the 20 s fix
-    /// window — then a fresh fix, then the pill fence. PM only.
+    /// window — then a fresh fix, then the page's test: the PM pill
+    /// fence (v55) or the AM walk test (v64).
     private func slcWake() {
         guard slcArmed else { return }
         guard !slcEvaluating else { return }
@@ -2402,22 +2424,50 @@ final class LocationTracker: NSObject {
                 return
             }
         }
-        let window = ScheduleManager.shared.latestWindow(forTab: "pm")
-        let nowMin = torontoMinutes(Date())
-        guard nowMin >= window.on - 5, nowMin <= window.off else {
-            nativeLog("SLC", "wake ignored - outside PM window [\(window.on - 5),\(window.off)] now=\(nowMin)")
+        // v64: the SLC switch (default on) gates every evaluation.
+        guard slcSwitchOn() else {
+            nativeLog("SLC", "wake ignored - SLC switch off")
             chkWriteWithFix(source: "slc", fix: slcTriggerFix)
             return
         }
-        if schedConsumed(page: "pm") {
+        // Page selection: PM keeps priority (the v55 behaviour);
+        // the AM walk test judges only when the PM occurrence is
+        // not the current one. The windows cannot overlap on sane
+        // settings (AM off 10:00, PM on-5 in the late afternoon).
+        let nowMin = torontoMinutes(Date())
+        let pmWindow = ScheduleManager.shared.latestWindow(forTab: "pm")
+        let amWindow = ScheduleManager.shared.latestWindow(forTab: "am")
+        let pmCurrent = nowMin >= pmWindow.on - 5 && nowMin <= pmWindow.off && !schedConsumed(page: "pm")
+        let amCurrent = nowMin >= amWindow.on - 5 && nowMin <= amWindow.off && !schedConsumed(page: "am")
+        let page: String
+        if pmCurrent {
+            page = "pm"
+        } else if amCurrent {
+            page = "am"
+        } else if nowMin >= pmWindow.on - 5, nowMin <= pmWindow.off {
             nativeLog("SLC", "wake ignored - PM occurrence consumed")
             chkWriteWithFix(source: "slc", fix: slcTriggerFix)
             return
+        } else if nowMin >= amWindow.on - 5, nowMin <= amWindow.off {
+            nativeLog("SLC", "wake ignored - AM occurrence consumed")
+            chkWriteWithFix(source: "slc", fix: slcTriggerFix)
+            return
+        } else {
+            nativeLog("SLC", "wake ignored - outside PM window [\(pmWindow.on - 5),\(pmWindow.off)] now=\(nowMin)")
+            chkWriteWithFix(source: "slc", fix: slcTriggerFix)
+            return
         }
-        nativeLog("SLC", "wake - evaluating (PM window [\(window.on - 5),\(window.off)])")
+        slcEvalPage = page
+        if page == "pm" {
+            nativeLog("SLC", "wake - evaluating (PM window [\(pmWindow.on - 5),\(pmWindow.off)])")
+        } else {
+            nativeLog("SLC", "wake - evaluating AM walk (AM window [\(amWindow.on - 5),\(amWindow.off)])")
+        }
         slcEvaluating = true
         slcCollecting = true
         slcBestFix = nil
+        slcMaxSpeed = -1
+        slcSawWalk = false
         slcManager.desiredAccuracy = kCLLocationAccuracyBest
         slcManager.startUpdatingLocation()
         let deadline = DispatchWorkItem { [weak self] in self?.slcFinishCollect() }
@@ -2448,6 +2498,10 @@ final class LocationTracker: NSObject {
             nativeLog("SLC", "fence undecided - poor fix acc=\(Int(acc))m")
             return
         }
+        if slcEvalPage == "am" {
+            slcFinishAm(fix: fix, acc: acc)
+            return
+        }
         guard let cfg = ScheduleManager.shared.configJSON(forTab: "pm"),
               let data = cfg.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -2469,6 +2523,80 @@ final class LocationTracker: NSObject {
             nativeLog("SLC", "fence REJECT dist=\(Int(dist))m acc=\(Int(acc))m (>500m from route start line)")
             chkWriteWithFix(source: "slc", fix: slcBestFix)
         }
+    }
+
+    /// v64: judge the AM walk test on the collected best fix. All
+    /// must hold: a home point is set (no home point, no AM
+    /// auto-start); the fix is outside the home point's 75 m ring
+    /// (he has left home); the fix is within 250 m of the
+    /// home -> My Stop line (the corridor); and the walk test
+    /// passes — walking pace seen during the collection, or the
+    /// best fix near-stationary at his stop (waiting). Any usable
+    /// fix at driving speed (>= 14 km/h) vetoes the start.
+    private func slcFinishAm(fix: CLLocation, acc: Double) {
+        guard let cfgJson = ScheduleManager.shared.configJSON(forTab: "am"),
+              let data = cfgJson.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            nativeLog("SLC", "AM not judged - no stored AM config")
+            return
+        }
+        let cfg = RideState(json: obj)
+        guard cfg.homeLat != 0 || cfg.homeLng != 0 else {
+            nativeLog("SLC", "AM not judged - no home point set")
+            return
+        }
+        guard let myNum = Int(cfg.myStopAm),
+              let myStop = cfg.stops.first(where: { $0.number == myNum }) else {
+            nativeLog("SLC", "AM not judged - My Stop '\(cfg.myStopAm)' not in AM config")
+            return
+        }
+        let lat = fix.coordinate.latitude
+        let lng = fix.coordinate.longitude
+        let homeDist = haversine(lat1: lat, lon1: lng, lat2: cfg.homeLat, lon2: cfg.homeLng)
+        guard homeDist > 75 else {
+            nativeLog("SLC", "AM REJECT - still at home (homeDist=\(Int(homeDist))m <= 75m)")
+            chkWriteWithFix(source: "slc", fix: slcBestFix)
+            return
+        }
+        let lineDist = slcSegmentDistance(fix: fix, lat1: cfg.homeLat, lng1: cfg.homeLng, lat2: myStop.lat, lng2: myStop.lng)
+        guard lineDist <= 250 else {
+            nativeLog("SLC", "AM REJECT - outside corridor (lineDist=\(Int(lineDist))m > 250m from home-stop line)")
+            chkWriteWithFix(source: "slc", fix: slcBestFix)
+            return
+        }
+        if slcMaxSpeed >= 3.9 {
+            nativeLog("SLC", "AM REJECT - drive veto (maxSpeed=\(Int(slcMaxSpeed * 3.6))km/h)")
+            chkWriteWithFix(source: "slc", fix: slcBestFix)
+            return
+        }
+        let stopDist = haversine(lat1: lat, lon1: lng, lat2: myStop.lat, lon2: myStop.lng)
+        let waiting = fix.speed < 0.55 && stopDist <= 250
+        guard slcSawWalk || waiting else {
+            nativeLog("SLC", "AM REJECT - no walk detected (speed=\(Int(fix.speed * 3.6))km/h stopDist=\(Int(stopDist))m)")
+            chkWriteWithFix(source: "slc", fix: slcBestFix)
+            return
+        }
+        nativeLog("SLC", "AM PASS homeDist=\(Int(homeDist))m lineDist=\(Int(lineDist))m acc=\(Int(acc))m \(slcSawWalk ? "walking" : "waiting") - starting AM ride")
+        pendingSlcStart = true
+        _ = handleScheduleTap(tab: "am")
+        pendingSlcStart = false
+    }
+
+    /// v64: distance in metres from the fix to a single segment,
+    /// in the same local projection slcPillDistance uses (the fix
+    /// is the origin).
+    private func slcSegmentDistance(fix: CLLocation, lat1: Double, lng1: Double, lat2: Double, lng2: Double) -> Double {
+        let lat0 = fix.coordinate.latitude
+        let lng0 = fix.coordinate.longitude
+        let mpdLng = 111320.0 * cos(lat0 * .pi / 180.0)
+        let mpdLat = 110540.0
+        let ax = (lng1 - lng0) * mpdLng, ay = (lat0 - lat1) * mpdLat
+        let bx = (lng2 - lng0) * mpdLng, by = (lat0 - lat2) * mpdLat
+        let dx = bx - ax, dy = by - ay
+        let l2 = dx * dx + dy * dy
+        var t = 0.0
+        if l2 > 0 { t = max(0, min(1, -(ax * dx + ay * dy) / l2)) }
+        return hypot(ax + t * dx, ay + t * dy)
     }
 
     /// Distance in metres from the fix to the pill's centre line:
