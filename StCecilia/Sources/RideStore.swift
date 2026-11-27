@@ -71,6 +71,9 @@ final class RideState {
     // v64: the page's SLC switch. Default ON — a config without
     // the key (older page, a persisted ride) keeps SLC available.
     var slcEnabled = true
+    // v87: the page's Refresh start switch. Default ON, same
+    // reasoning as slcEnabled.
+    var refreshEnabled = true
     var schedOn1 = 480
     var schedOff1 = 600
     var schedOn2 = 930
@@ -81,6 +84,11 @@ final class RideState {
     // subject to the 15-minute no-progress abandon. Stamped ONLY via
     // the one-shot flag consumed in createFreshRide.
     var slcStarted = false
+    // v87: which trigger started this ride (the A2 vocabulary):
+    // manual / alarm / open / slc / geofence-exit / geofence-enter /
+    // refresh / remote. Stamped in createFreshRide from the one-shot
+    // pendingStartTrigger; persisted with the ride.
+    var startTrigger = ""
     var stops: [RideStop] = []
     // Unified ride-state identity (Phase 1, shadow mode): stamped fresh at
     // ride start, carried across applyConfig progress merges, persisted
@@ -143,6 +151,7 @@ final class RideState {
         }
         schedEnabled = json["schedEnabled"] as? Bool ?? false
         slcEnabled = json["slcEnabled"] as? Bool ?? true
+        refreshEnabled = json["refreshEnabled"] as? Bool ?? true
         schedOn1 = json["schedOn1"] as? Int ?? 480
         schedOff1 = json["schedOff1"] as? Int ?? 600
         schedOn2 = json["schedOn2"] as? Int ?? 930
@@ -150,6 +159,7 @@ final class RideState {
         schedWeekdaysOnly = json["schedWeekdaysOnly"] as? Bool ?? true
         scheduledRide = json["scheduledRide"] as? Bool ?? false
         slcStarted = json["slcStarted"] as? Bool ?? false
+        startTrigger = json["startTrigger"] as? String ?? ""
         rideId = json["rideId"] as? String ?? ""
         if let v = json["startedAt"] as? Int {
             startedAt = v
@@ -202,6 +212,7 @@ final class RideState {
             "snapDistance": snapDistance,
             "schedEnabled": schedEnabled,
             "slcEnabled": slcEnabled,
+            "refreshEnabled": refreshEnabled,
             "schedOn1": schedOn1,
             "schedOff1": schedOff1,
             "schedOn2": schedOn2,
@@ -209,6 +220,7 @@ final class RideState {
             "schedWeekdaysOnly": schedWeekdaysOnly,
             "scheduledRide": scheduledRide,
             "slcStarted": slcStarted,
+            "startTrigger": startTrigger,
             "rideId": rideId,
             "startedAt": startedAt,
             "startSource": startSource,

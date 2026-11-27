@@ -72,6 +72,25 @@ final class LocationTracker: NSObject {
     /// it calls handleScheduleTap; consumed (and cleared) in
     /// createFreshRide, which stamps the new ride's slcStarted.
     private var pendingSlcStart = false
+    /// v87: one-shot trigger token for the next fresh ride (spec
+    /// A2/A3): set by the auto-start origins (SLC evaluator,
+    /// geofence, refresh start, panel remote) immediately before
+    /// the start call; consumed (and cleared) when the fresh ride
+    /// is stamped, into the ride's startTrigger. Empty = derive
+    /// from `scheduled` ("open" / "manual").
+    private var pendingStartTrigger = ""
+    /// v87: which wake is running the current SLC evaluation:
+    /// "slc" (a significant-change delivery) or a geofence token.
+    /// Captured (and reset) at the top of slcFinishCollect.
+    private var slcWakeSource = "slc"
+    /// v87: the two AM geofence regions (home exit + stop enter),
+    /// registered while SLC is armed and a home point + an AM
+    /// My Stop exist in the stored AM config (spec B1/B5).
+    private var homeRegion: CLCircularRegion?
+    private var stopRegion: CLCircularRegion?
+    /// v87: the fix the current background-refresh cycle's check-in
+    /// collection produced (the refresh-start veto judges it, B3).
+    private var refreshFix: CLLocation?
     /// v55 amendment: true when this process was launched in the
     /// background state — the launch activation check then logs its
     /// verdict but never fires and never consumes an occurrence.
@@ -287,6 +306,9 @@ final class LocationTracker: NSObject {
         let slcDel = SlcLocationDelegate()
         slcDel.onLocations = { [weak self] locs in self?.slcLocations(locs) }
         slcDel.onFailure = { [weak self] in self?.slcFixFailed() }
+        slcDel.onRegion = { [weak self] id, entered in self?.slcRegionEvent(identifier: id, entered: entered) }
+        slcDel.onRegionState = { [weak self] region, inside in self?.slcRegionDetermined(region: region, inside: inside) }
+        slcDel.onRegionFail = { [weak self] id in self?.nativeLog("SLC", "geofence monitoring failed id=\(id)") }
         slcDelegate = slcDel
         slcManager.delegate = slcDel
         slcManager.desiredAccuracy = kCLLocationAccuracyHundredMeters
@@ -651,7 +673,8 @@ final class LocationTracker: NSObject {
     /// only per the rules below; a fresh ride is created only when no live
     /// ride exists (or a scheduled start overrides a different tab).
     func startRide(configJson: String?, scheduled: Bool = false) -> String {
-        nativeLog("SYS", "startRide scheduled=\(scheduled)")
+        let trig = pendingStartTrigger.isEmpty ? (scheduled ? "open" : "manual") : pendingStartTrigger
+        nativeLog("SYS", "startRide scheduled=\(scheduled) trigger=\(trig)")
         guard let configJson = configJson, !configJson.isEmpty,
               let data = configJson.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -701,6 +724,7 @@ final class LocationTracker: NSObject {
                 if live.lastFixTime == nil, live.stops.allSatisfy({ !$0.reached && !$0.skipped }),
                    live.startSource != "schedule" {
                     live.startSource = "schedule"
+                    live.startTrigger = "open"
                     live.scheduledRide = true
                     persist()
                     nativeLog("SCHED", "re-tagged startSource=schedule ride=\(id8(live))")
@@ -743,6 +767,9 @@ final class LocationTracker: NSObject {
         // every other fresh start consumes (clears) it unstamped.
         r.slcStarted = pendingSlcStart
         pendingSlcStart = false
+        // v87: stamp the trigger that produced this ride (A2).
+        r.startTrigger = pendingStartTrigger.isEmpty ? (scheduled ? "open" : "manual") : pendingStartTrigger
+        pendingStartTrigger = ""
         r.routeFingerprint = r.computeFingerprint()
         r.scheduledRide = scheduled
         if !override { EndedStore.clear() }
@@ -2104,8 +2131,14 @@ final class LocationTracker: NSObject {
             statusStr = "already-on-a-ride"
         } else {
             let page = torontoMinutes(Date()) < 720 ? "am" : "pm"
-            guard let jsonStr = ScheduleManager.shared.configJSON(forTab: page),
-                  startRide(configJson: jsonStr, scheduled: true) == "started" else {
+            guard let jsonStr = ScheduleManager.shared.configJSON(forTab: page) else {
+                nativeLog("REMOTESTART", "start failed - no stored config for page \(page)")
+                return
+            }
+            pendingStartTrigger = "remote"
+            let startedOk = startRide(configJson: jsonStr, scheduled: true) == "started"
+            pendingStartTrigger = ""
+            guard startedOk else {
                 nativeLog("REMOTESTART", "start failed - no stored config for page \(page)")
                 return
             }
@@ -2120,7 +2153,17 @@ final class LocationTracker: NSObject {
                                   "at": Int64(Date().timeIntervalSince1970 * 1000), "dark": dark]
         FirebaseClient.put(base: cfg.fbBase, path: parent + "/startRequests", tag: cfg.deviceId, body: ack) { _ in }
         UserDefaults.standard.set(reqMs, forKey: startRungKey)
-        nativeLog("REMOTESTART", "panel start request \(statusStr)\(dark ? " (dark)" : "")")
+        // v87 (A4): the line carries the request's placed time
+        // (Toronto, from the panel's own stamp) and its age at
+        // pickup, on both the started and already-on-a-ride acks.
+        let placedFmt = DateFormatter()
+        placedFmt.calendar = Calendar(identifier: .gregorian)
+        placedFmt.locale = Locale(identifier: "en_US_POSIX")
+        placedFmt.timeZone = torontoTimeZone
+        placedFmt.dateFormat = "HH:mm:ss"
+        let placedStr = placedFmt.string(from: Date(timeIntervalSince1970: reqMs / 1000))
+        let ageSec = Int((Date().timeIntervalSince1970 * 1000 - reqMs) / 1000)
+        nativeLog("REMOTESTART", "panel start request \(statusStr) placed \(placedStr) age \(ageSec)s\(dark ? " (dark)" : "")")
     }
 
     private func locateCheck(cfg: RideState, parent: String, completion: (() -> Void)?) {
@@ -2261,6 +2304,8 @@ final class LocationTracker: NSObject {
         chkSawSlcBatch = false
         let cfg = chkCfg
         chkCfg = nil
+        // v87: stash this cycle's fix for the refresh-start veto.
+        if chkSource == "refresh" { refreshFix = chkBestFix }
         if let cfg = cfg, let f = chkBestFix, f.horizontalAccuracy >= 0, f.horizontalAccuracy <= 500 {
             chkPut(cfg: cfg, source: chkSource, fix: f, completion: completion)
         } else {
@@ -2308,6 +2353,11 @@ final class LocationTracker: NSObject {
         }
     }
 
+    /// v87: AppDelegate clears the stashed refresh fix before each
+    /// refresh cycle's check-in, so the veto only ever judges a fix
+    /// from THIS wake.
+    func refreshFixBegin() { refreshFix = nil }
+
     func updateSlcArming(enabled: Bool) {
         if enabled {
             guard CLLocationManager.significantLocationChangeMonitoringAvailable() else {
@@ -2317,11 +2367,13 @@ final class LocationTracker: NSObject {
             slcManager.startMonitoringSignificantLocationChanges()
             if !slcArmed { nativeLog("SLC", "armed (schedule toggle on)") }
             slcArmed = true
+            updateGeofenceRegions()
         } else {
             if slcArmed { nativeLog("SLC", "disarmed (schedule toggle off)") }
             slcArmed = false
             slcCollectCancel()
             slcManager.stopMonitoringSignificantLocationChanges()
+            stopGeofenceRegions()
         }
     }
 
@@ -2329,13 +2381,183 @@ final class LocationTracker: NSObject {
         updateSlcArming(enabled: UserDefaults.standard.bool(forKey: "stcecilia_sched_enabled") && slcSwitchOn())
     }
 
-    /// v64: the page's SLC switch, stored by ScheduleManager.apply
-    /// from the ride config. Absent = ON. The St Cecilia page has
-    /// no SLC switch and never sends the key, so this stays ON
-    /// here — the helper exists to keep the evaluator identical
-    /// to the Bus app's, where the switch is real (Bus web v9.45).
+    /// The page's SLC switch, stored by ScheduleManager.apply
+    /// from the ride config. Absent = ON. (The key and the gate
+    /// shipped in v64; the St Cecilia page gained the switch
+    /// itself in web v8.43, v87 round.)
     func slcSwitchOn() -> Bool {
         return UserDefaults.standard.object(forKey: "stcecilia_slc_enabled") as? Bool ?? true
+    }
+
+    /// v87: the page's Refresh start switch (St Cecilia web
+    /// v8.43), stored by ScheduleManager.apply from the ride
+    /// config. Absent = ON.
+    func refreshSwitchOn() -> Bool {
+        return UserDefaults.standard.object(forKey: "stcecilia_refresh_enabled") as? Bool ?? true
+    }
+
+    // MARK: - v87 geofence (Region Monitoring) + refresh start
+    //
+    // Two 100 m regions feed the SAME AM judgement the SLC wake
+    // runs — exiting the home circle, entering the AM My Stop
+    // circle. The geofence changes only the wake (spec B1).
+
+    private static let homeRegionID = "v87.home.exit"
+    private static let stopRegionID = "v87.stop.enter"
+
+    private func updateGeofenceRegions() {
+        guard let cfgJson = ScheduleManager.shared.configJSON(forTab: "am"),
+              let data = cfgJson.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            stopGeofenceRegions()
+            return
+        }
+        let cfg = RideState(json: obj)
+        guard cfg.homeLat != 0 || cfg.homeLng != 0,
+              let myNum = Int(cfg.myStopAm),
+              let myStop = cfg.stops.first(where: { $0.number == myNum }) else {
+            // No home point or no AM My Stop: the regions cannot be
+            // registered (B5) — the AM judgement never arms either.
+            stopGeofenceRegions()
+            return
+        }
+        let home = CLCircularRegion(center: CLLocationCoordinate2D(latitude: cfg.homeLat, longitude: cfg.homeLng), radius: 100, identifier: Self.homeRegionID)
+        home.notifyOnEntry = false
+        home.notifyOnExit = true
+        let stop = CLCircularRegion(center: CLLocationCoordinate2D(latitude: myStop.lat, longitude: myStop.lng), radius: 100, identifier: Self.stopRegionID)
+        stop.notifyOnEntry = true
+        stop.notifyOnExit = false
+        if let old = homeRegion, abs(old.center.latitude - home.center.latitude) < 0.00001, abs(old.center.longitude - home.center.longitude) < 0.00001 {
+            // Same circle — keep the existing registration.
+        } else {
+            if let old = homeRegion { slcManager.stopMonitoring(for: old) }
+            homeRegion = home
+            slcManager.startMonitoring(for: home)
+            nativeLog("SLC", "geofence home-exit region registered (100 m)")
+        }
+        if let old = stopRegion, abs(old.center.latitude - stop.center.latitude) < 0.00001, abs(old.center.longitude - stop.center.longitude) < 0.00001 {
+            // Same circle — keep the existing registration.
+        } else {
+            if let old = stopRegion { slcManager.stopMonitoring(for: old) }
+            stopRegion = stop
+            slcManager.startMonitoring(for: stop)
+            nativeLog("SLC", "geofence stop-enter region registered (100 m)")
+        }
+    }
+
+    private func stopGeofenceRegions() {
+        if let r = homeRegion { slcManager.stopMonitoring(for: r); homeRegion = nil }
+        if let r = stopRegion { slcManager.stopMonitoring(for: r); stopRegion = nil }
+    }
+
+    /// A geofence crossing arrived. AM-only (B4): outside the AM
+    /// window the event is logged and spent (A5/B1); inside it,
+    /// the wake runs the existing SLC evaluation, with the
+    /// geofence token as the pending trigger.
+    private func slcRegionEvent(identifier: String, entered: Bool) {
+        let isHome = identifier == Self.homeRegionID
+        let name = isHome ? "home-exit" : "stop-enter"
+        let window = ScheduleManager.shared.latestWindow(forTab: "am")
+        let nowMin = torontoMinutes(Date())
+        guard nowMin >= window.on - 5 && nowMin <= window.off else {
+            nativeLog("SLC", "geofence \(name) - outside AM window [\(window.on - 5),\(window.off)] now=\(nowMin), ignored")
+            return
+        }
+        nativeLog("SLC", "geofence \(name) - evaluating AM walk")
+        slcWakeSource = isHome ? "geofence-exit" : "geofence-enter"
+        slcWake()
+    }
+
+    /// B1 already-inside rule: ask iOS for the stop region's
+    /// current state; if the phone is already inside, the state
+    /// callback treats it as an enter. Called on in-window wakes
+    /// that did not themselves start a ride.
+    func slcRegionStateCheck() {
+        guard let region = stopRegion else { return }
+        slcManager.requestState(for: region)
+    }
+
+    private func slcRegionDetermined(region: CLRegion, inside: Bool) {
+        guard region.identifier == Self.stopRegionID, inside else { return }
+        let window = ScheduleManager.shared.latestWindow(forTab: "am")
+        let nowMin = torontoMinutes(Date())
+        guard nowMin >= window.on - 5 && nowMin <= window.off else { return }
+        guard slcArmed, !slcEvaluating, !hasLiveRide else { return }
+        nativeLog("SLC", "geofence stop-enter (already inside) - evaluating AM walk")
+        slcWakeSource = "geofence-enter"
+        slcWake()
+    }
+
+    /// v87 refresh start (spec B2/B3): a background-refresh wake
+    /// inside the AM window starts the ride on the window alone —
+    /// no location test — after the AM occurrence check (a
+    /// schedule-family start never fires twice in a morning). The
+    /// wake's own fix can veto the start when it places the phone
+    /// at school (a driven morning leaves no junk ride). Every
+    /// outcome leaves a verdict line (A5).
+    func refreshStartEvaluate() {
+        let d = UserDefaults.standard
+        guard d.bool(forKey: "stcecilia_sched_enabled") else {
+            nativeLog("SCHED", "refresh start skipped - schedule disabled")
+            return
+        }
+        let window = ScheduleManager.shared.latestWindow(forTab: "am")
+        let nowMin = torontoMinutes(Date())
+        let inWindow = nowMin >= window.on - 5 && nowMin <= window.off
+        guard refreshSwitchOn() else {
+            nativeLog("SCHED", "refresh start skipped - refresh switch off")
+            if inWindow { slcRegionStateCheck() }
+            return
+        }
+        if d.bool(forKey: "stcecilia_sched_weekdays") {
+            var cal = Calendar(identifier: .gregorian)
+            cal.timeZone = torontoTimeZone
+            let wd = cal.component(.weekday, from: Date())
+            if wd == 1 || wd == 7 {
+                nativeLog("SCHED", "refresh start skipped - weekend, weekdays-only")
+                return
+            }
+        }
+        guard inWindow else {
+            nativeLog("SCHED", "refresh start skipped - outside AM window [\(window.on - 5),\(window.off)] now=\(nowMin)")
+            return
+        }
+        guard !hasLiveRide else {
+            nativeLog("SCHED", "refresh start skipped - live ride")
+            return
+        }
+        guard !slcEvaluating else {
+            nativeLog("SCHED", "refresh start skipped - SLC evaluation in progress")
+            return
+        }
+        guard !schedConsumed(page: "am") else {
+            nativeLog("SCHED", "refresh start skipped - AM occurrence consumed")
+            return
+        }
+        var vetoNote = "no fix on this wake - no veto possible"
+        if let fix = refreshFix, fix.horizontalAccuracy >= 0, fix.horizontalAccuracy <= 500,
+           Date().timeIntervalSince(fix.timestamp) <= 120,
+           let cfgJson = ScheduleManager.shared.configJSON(forTab: "am"),
+           let data = cfgJson.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            let cfg = RideState(json: obj)
+            if let school = cfg.stops.last {
+                let dist = haversine(lat1: fix.coordinate.latitude, lon1: fix.coordinate.longitude, lat2: school.lat, lon2: school.lng)
+                if dist <= 250 {
+                    nativeLog("SCHED", "refresh start VETOED - at school (dist=\(Int(dist))m <= 250m)")
+                    return
+                }
+                vetoNote = "fix \(Int(dist))m from school - no veto"
+            }
+        }
+        nativeLog("SCHED", "refresh start - starting AM ride (\(vetoNote))")
+        pendingStartTrigger = "refresh"
+        let started = handleScheduleTap(tab: "am")
+        pendingStartTrigger = ""
+        if !started || !hasLiveRide {
+            nativeLog("SCHED", "refresh start failed - start did not take")
+            slcRegionStateCheck()
+        }
     }
 
     private func slcLocations(_ locations: [CLLocation]) {
@@ -2489,6 +2711,10 @@ final class LocationTracker: NSObject {
     private func slcFinishCollect() {
         guard slcCollecting else { return }
         slcCollectCancel()
+        // v87: capture which wake ran this evaluation, then reset
+        // for the next one (a plain SLC delivery is the default).
+        let wakeSource = slcWakeSource
+        slcWakeSource = "slc"
         guard let fix = slcBestFix else {
             nativeLog("SLC", "fence undecided - no fix in 20s")
             return
@@ -2499,7 +2725,7 @@ final class LocationTracker: NSObject {
             return
         }
         if slcEvalPage == "am" {
-            slcFinishAm(fix: fix, acc: acc)
+            slcFinishAm(fix: fix, acc: acc, wakeSource: wakeSource)
             return
         }
         guard let cfg = ScheduleManager.shared.configJSON(forTab: "pm"),
@@ -2517,8 +2743,10 @@ final class LocationTracker: NSObject {
         if dist <= 500 {
             nativeLog("SLC", "fence PASS dist=\(Int(dist))m acc=\(Int(acc))m - starting PM ride")
             pendingSlcStart = true
+            pendingStartTrigger = wakeSource
             _ = handleScheduleTap(tab: "pm")
             pendingSlcStart = false
+            pendingStartTrigger = ""
         } else {
             nativeLog("SLC", "fence REJECT dist=\(Int(dist))m acc=\(Int(acc))m (>500m from route start line)")
             chkWriteWithFix(source: "slc", fix: slcBestFix)
@@ -2533,7 +2761,7 @@ final class LocationTracker: NSObject {
     /// passes — walking pace seen during the collection, or the
     /// best fix near-stationary at his stop (waiting). Any usable
     /// fix at driving speed (>= 14 km/h) vetoes the start.
-    private func slcFinishAm(fix: CLLocation, acc: Double) {
+    private func slcFinishAm(fix: CLLocation, acc: Double, wakeSource: String) {
         guard let cfgJson = ScheduleManager.shared.configJSON(forTab: "am"),
               let data = cfgJson.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -2578,8 +2806,10 @@ final class LocationTracker: NSObject {
         }
         nativeLog("SLC", "AM PASS homeDist=\(Int(homeDist))m lineDist=\(Int(lineDist))m acc=\(Int(acc))m \(slcSawWalk ? "walking" : "waiting") - starting AM ride")
         pendingSlcStart = true
+        pendingStartTrigger = wakeSource
         _ = handleScheduleTap(tab: "am")
         pendingSlcStart = false
+        pendingStartTrigger = ""
     }
 
     /// v64: distance in metres from the fix to a single segment,
@@ -2644,11 +2874,16 @@ final class LocationTracker: NSObject {
     /// consumed at start, so nothing can resurrect the ride.
     @discardableResult
     private func checkSlcAbandon() -> Bool {
-        guard let r = ride, r.slcStarted, !r.completed, !r.ended else { return false }
+        // v87 (spec C): the abandon covers every auto start, keyed
+        // on the persisted startTrigger; slcStarted still counts
+        // for a ride an older build started. Manual / open / remote
+        // starts stay exempt — a person started those.
+        let autoTriggers: Set<String> = ["slc", "geofence-exit", "geofence-enter", "refresh"]
+        guard let r = ride, (r.slcStarted || autoTriggers.contains(r.startTrigger)), !r.completed, !r.ended else { return false }
         guard !r.stops.contains(where: { $0.reached }) else { return false }
         let nowMs = Int(Date().timeIntervalSince1970 * 1000)
         guard nowMs - r.startedAt >= 900_000 else { return false }
-        nativeLog("SLC", "abandon ride=\(String(r.rideId.prefix(8))) - no stop reached in 15 min")
+        nativeLog("SLC", "abandon ride=\(String(r.rideId.prefix(8))) trigger=\(r.startTrigger.isEmpty ? "slc" : r.startTrigger) - no stop reached in 15 min")
         postAbandonNotification()
         r.ended = true
         r.endedAt = nowMs
@@ -2750,10 +2985,26 @@ extension LocationTracker: CLLocationManagerDelegate {
 private final class SlcLocationDelegate: NSObject, CLLocationManagerDelegate {
     var onLocations: (([CLLocation]) -> Void)?
     var onFailure: (() -> Void)?
+    // v87: geofence (Region Monitoring) callbacks.
+    var onRegion: ((String, Bool) -> Void)?
+    var onRegionState: ((CLRegion, Bool) -> Void)?
+    var onRegionFail: ((String) -> Void)?
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         onLocations?(locations)
     }
     func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
         onFailure?()
+    }
+    func locationManager(_ manager: CLLocationManager, didEnterRegion region: CLRegion) {
+        onRegion?(region.identifier, true)
+    }
+    func locationManager(_ manager: CLLocationManager, didExitRegion region: CLRegion) {
+        onRegion?(region.identifier, false)
+    }
+    func locationManager(_ manager: CLLocationManager, didDetermineState state: CLRegionState, for region: CLRegion) {
+        onRegionState?(region, state == .inside)
+    }
+    func locationManager(_ manager: CLLocationManager, monitoringDidFailFor region: CLRegion?, withError error: Error) {
+        onRegionFail?(region?.identifier ?? "?")
     }
 }

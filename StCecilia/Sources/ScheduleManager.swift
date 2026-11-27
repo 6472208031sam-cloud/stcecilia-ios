@@ -23,13 +23,14 @@ final class ScheduleManager {
     /// applyScheduleSettings() — safe to call with no active ride.
     func apply(config: RideState) {
         let tabKey = config.tab == "pm" ? "pm" : "am"
-        LocationTracker.shared.schedLog("apply tab=\(tabKey) enabled=\(config.schedEnabled) on1=\(config.schedOn1) on2=\(config.schedOn2) weekdaysOnly=\(config.schedWeekdaysOnly) slc=\(config.slcEnabled)")
+        LocationTracker.shared.schedLog("apply tab=\(tabKey) enabled=\(config.schedEnabled) on1=\(config.schedOn1) on2=\(config.schedOn2) weekdaysOnly=\(config.schedWeekdaysOnly) slc=\(config.slcEnabled) refresh=\(config.refreshEnabled)")
         if let data = try? JSONSerialization.data(withJSONObject: config.toJSON()) {
             UserDefaults.standard.set(data, forKey: "stcecilia_sched_config_" + tabKey)
         }
         let d = UserDefaults.standard
         d.set(config.schedEnabled, forKey: "stcecilia_sched_enabled")
         d.set(config.slcEnabled, forKey: "stcecilia_slc_enabled")
+        d.set(config.refreshEnabled, forKey: "stcecilia_refresh_enabled")
         d.set(config.schedOn1, forKey: "stcecilia_sched_on1")
         d.set(config.schedOff1, forKey: "stcecilia_sched_off1")
         d.set(config.schedOn2, forKey: "stcecilia_sched_on2")

@@ -127,7 +127,12 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterD
         // v56: the refresh wake also leaves a check-in; the task
         // completes only after the (<=8 s) collection resolves, so
         // the write is issued inside the task window.
+        LocationTracker.shared.refreshFixBegin()
         LocationTracker.shared.chkAttempt(source: "refresh", snapshotIdle: false) {
+            // v87: a refresh wake inside the AM window may start
+            // the ride itself (refresh start, spec B2) — judged
+            // on this cycle's check-in fix, inside the task window.
+            LocationTracker.shared.refreshStartEvaluate()
             // v57: the refresh wake also polls for a log request,
             // chained inside the task window like the check-in.
             LocationTracker.shared.logReqPoll {
