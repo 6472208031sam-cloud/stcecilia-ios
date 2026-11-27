@@ -2159,7 +2159,7 @@ final class LocationTracker: NSObject {
         let placedFmt = DateFormatter()
         placedFmt.calendar = Calendar(identifier: .gregorian)
         placedFmt.locale = Locale(identifier: "en_US_POSIX")
-        placedFmt.timeZone = torontoTimeZone
+        placedFmt.timeZone = TimeZone(identifier: "America/Toronto")!
         placedFmt.dateFormat = "HH:mm:ss"
         let placedStr = placedFmt.string(from: Date(timeIntervalSince1970: reqMs / 1000))
         let ageSec = Int((Date().timeIntervalSince1970 * 1000 - reqMs) / 1000)
@@ -2510,9 +2510,7 @@ final class LocationTracker: NSObject {
             return
         }
         if d.bool(forKey: "stcecilia_sched_weekdays") {
-            var cal = Calendar(identifier: .gregorian)
-            cal.timeZone = torontoTimeZone
-            let wd = cal.component(.weekday, from: Date())
+            let wd = torontoCalendar.component(.weekday, from: Date())
             if wd == 1 || wd == 7 {
                 nativeLog("SCHED", "refresh start skipped - weekend, weekdays-only")
                 return
